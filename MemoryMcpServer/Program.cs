@@ -4,6 +4,7 @@ using MemoryMcpServer.Services;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddOpenApi();
+builder.Services.AddScoped<IContextRetrievalService, ContextRetrievalService>();
 builder.Services.AddScoped<IContextService, ContextService>();
 
 var app = builder.Build();

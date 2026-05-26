@@ -5,10 +5,12 @@ namespace MemoryMcpServer.Services;
 
 public sealed class ContextService : IContextService
 {
+    private readonly IContextRetrievalService _retrievalService;
     private readonly string _connectionString;
 
-    public ContextService(IConfiguration configuration)
+    public ContextService(IContextRetrievalService retrievalService, IConfiguration configuration)
     {
+        _retrievalService = retrievalService;
         _connectionString = configuration["MCP_SCANNER_CONNECTION"]
             ?? Environment.GetEnvironmentVariable("MCP_SCANNER_CONNECTION")
             ?? throw new InvalidOperationException("MCP_SCANNER_CONNECTION is required.");
@@ -32,177 +34,46 @@ public sealed class ContextService : IContextService
             .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        var intent = ParseIntent(normalizedTask);
+        var retrieval = await _retrievalService.RetrieveAsync(
+            new RetrievalRequest(
+                Task: normalizedTask,
+                Scope: normalizedScope,
+                Constraints: constraints,
+                FilesHint: filesHint),
+            cancellationToken);
+
+        if (retrieval.ScanRunId is null)
+        {
+            return BuildEmptyResponse(retrieval.TaskIntent, retrieval.ConstraintsApplied);
+        }
 
         await using var connection = new NpgsqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
 
-        var snapshot = await GetLatestSnapshotAsync(connection, cancellationToken);
-        if (snapshot is null)
-        {
-            return BuildEmptyResponse(intent, constraints);
-        }
+        var relatedSymbols = await ExpandRelatedSymbolsAsync(connection, retrieval.ScanRunId.Value, retrieval.PrimaryTargets, cancellationToken);
+        var proposedEdits = BuildProposedEdits(retrieval.TaskIntent, retrieval.PrimaryTargets);
+        var verification = BuildVerification(retrieval.PrimaryTargets);
+        var inclusionReasons = BuildInclusionReasons(
+            retrieval.PrimaryTargets,
+            relatedSymbols,
+            filesHint,
+            constraints,
+            normalizedScope,
+            retrieval.TargetHints);
 
-        var symbolCandidates = await QueryPrimaryTargetsAsync(connection, snapshot.Value.RunId, normalizedTask, normalizedScope, filesHint, constraints, cancellationToken);
-        var primaryTargets = symbolCandidates
-            .OrderByDescending(c => c.Score)
-            .ThenBy(c => c.SymbolKey, StringComparer.Ordinal)
-            .Take(10)
-            .Select(c => new ContextTarget(c.SymbolKey, c.FilePath, c.Kind, c.Score))
-            .ToArray();
-
-        var relatedSymbols = await ExpandRelatedSymbolsAsync(connection, snapshot.Value.RunId, primaryTargets, cancellationToken);
-        var constraintsApplied = BuildConstraintsApplied(constraints, normalizedScope, filesHint);
-        var proposedEdits = BuildProposedEdits(intent, primaryTargets);
-        var verification = BuildVerification(primaryTargets);
-        var inclusionReasons = BuildInclusionReasons(primaryTargets, relatedSymbols, filesHint, constraints, normalizedScope);
-        var confidence = CalculateConfidence(primaryTargets, filesHint, constraints);
+        var confidence = CalculateConfidence(retrieval.PrimaryTargets, filesHint, constraints);
 
         return new GetContextResponse(
-            TaskIntent: intent,
-            PrimaryTargets: primaryTargets,
+            TaskIntent: retrieval.TaskIntent,
+            PrimaryTargets: retrieval.PrimaryTargets,
             RelatedSymbols: relatedSymbols,
-            ConstraintsApplied: constraintsApplied,
+            ConstraintsApplied: retrieval.ConstraintsApplied,
             ProposedEdits: proposedEdits,
             Verification: verification,
-            Freshness: new Freshness(snapshot.Value.CommitSha, snapshot.Value.IndexedAtUtc),
+            Freshness: retrieval.Freshness,
             Confidence: confidence,
             InclusionReasons: inclusionReasons);
     }
-
-    private static IReadOnlyList<string> ParseIntent(string task)
-    {
-        var intents = new List<string>();
-
-        if (ContainsAny(task, "fix", "bug", "ошиб", "исправ")) intents.Add("fix");
-        if (ContainsAny(task, "add", "new", "добав")) intents.Add("add");
-        if (ContainsAny(task, "change", "update", "измени", "обнов")) intents.Add("change");
-        if (ContainsAny(task, "remove", "delete", "удал")) intents.Add("remove");
-        if (ContainsAny(task, "refactor", "рефактор")) intents.Add("refactor");
-        if (ContainsAny(task, "test", "тест")) intents.Add("test");
-
-        if (intents.Count == 0)
-        {
-            intents.Add("change");
-        }
-
-        return intents
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(i => i, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    private static bool ContainsAny(string text, params string[] tokens)
-        => tokens.Any(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
-
-    private async Task<SnapshotInfo?> GetLatestSnapshotAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
-    {
-        const string sql = """
-                           SELECT id, commit_sha, finished_at_utc
-                           FROM latest_successful_scan_runs
-                           ORDER BY started_at_utc DESC
-                           LIMIT 1;
-                           """;
-
-        await using var command = new NpgsqlCommand(sql, connection);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-
-        if (!await reader.ReadAsync(cancellationToken))
-        {
-            return null;
-        }
-
-        return new SnapshotInfo(
-            RunId: reader.GetInt64(0),
-            CommitSha: reader.GetString(1),
-            IndexedAtUtc: reader.IsDBNull(2) ? DateTimeOffset.UtcNow : reader.GetFieldValue<DateTimeOffset>(2));
-    }
-
-    private static async Task<IReadOnlyList<SymbolCandidate>> QueryPrimaryTargetsAsync(
-        NpgsqlConnection connection,
-        long runId,
-        string task,
-        string scope,
-        IReadOnlyList<string> filesHint,
-        IReadOnlyList<string> constraints,
-        CancellationToken cancellationToken)
-    {
-        var taskTokens = Tokenize(task);
-        var scopeTokens = Tokenize(scope);
-
-        const string sql = """
-                           SELECT symbol_key, kind, file_path, name
-                           FROM symbols
-                           WHERE scan_run_id = @run_id;
-                           """;
-
-        await using var command = new NpgsqlCommand(sql, connection);
-        command.Parameters.AddWithValue("run_id", runId);
-
-        var candidates = new List<SymbolCandidate>();
-
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
-        {
-            var symbolKey = reader.GetString(0);
-            var kind = reader.GetString(1);
-            var filePath = reader.IsDBNull(2) ? null : reader.GetString(2);
-            var name = reader.GetString(3);
-
-            if (IsDoNotTouch(filePath, constraints))
-            {
-                continue;
-            }
-
-            var score = 0.0;
-
-            if (!string.IsNullOrWhiteSpace(filePath) && filesHint.Any(f => filePath.Contains(f, StringComparison.OrdinalIgnoreCase)))
-            {
-                score += 2.0;
-            }
-
-            if (taskTokens.Any(t => name.Contains(t, StringComparison.OrdinalIgnoreCase) || symbolKey.Contains(t, StringComparison.OrdinalIgnoreCase)))
-            {
-                score += 1.2;
-            }
-
-            if (scopeTokens.Length > 0 &&
-                (scopeTokens.Any(t => symbolKey.Contains(t, StringComparison.OrdinalIgnoreCase)) ||
-                 (!string.IsNullOrWhiteSpace(filePath) && scopeTokens.Any(t => filePath.Contains(t, StringComparison.OrdinalIgnoreCase)))))
-            {
-                score += 0.8;
-            }
-
-            if (score > 0)
-            {
-                candidates.Add(new SymbolCandidate(symbolKey, kind, filePath, score));
-            }
-        }
-
-        return candidates;
-    }
-
-    private static bool IsDoNotTouch(string? filePath, IReadOnlyList<string> constraints)
-    {
-        if (string.IsNullOrWhiteSpace(filePath))
-        {
-            return false;
-        }
-
-        var doNotTouch = constraints
-            .Where(c => c.StartsWith("do-not-touch", StringComparison.OrdinalIgnoreCase))
-            .SelectMany(c => c.Split(':', 2).Skip(1))
-            .SelectMany(v => v.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            .ToArray();
-
-        return doNotTouch.Any(x => filePath.Contains(x, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static string[] Tokenize(string value)
-        => value.Split([' ', ',', '.', ';', ':', '/', '\\', '(', ')', '[', ']', '{', '}', '-', '_', '"', '\''], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(t => t.Length >= 3)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
 
     private static async Task<IReadOnlyList<RelatedSymbol>> ExpandRelatedSymbolsAsync(
         NpgsqlConnection connection,
@@ -246,31 +117,6 @@ public sealed class ContextService : IContextService
             .ToArray();
     }
 
-    private static IReadOnlyList<string> BuildConstraintsApplied(
-        IReadOnlyList<string> constraints,
-        string scope,
-        IReadOnlyList<string> filesHint)
-    {
-        var applied = new List<string>();
-
-        applied.AddRange(constraints);
-
-        if (!string.IsNullOrWhiteSpace(scope))
-        {
-            applied.Add($"scope:{scope}");
-        }
-
-        if (filesHint.Count > 0)
-        {
-            applied.Add($"filesHint:{string.Join(',', filesHint)}");
-        }
-
-        return applied
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
     private static IReadOnlyList<ProposedEdit> BuildProposedEdits(IReadOnlyList<string> intent, IReadOnlyList<ContextTarget> primaryTargets)
     {
         return primaryTargets
@@ -306,7 +152,8 @@ public sealed class ContextService : IContextService
         IReadOnlyList<RelatedSymbol> relatedSymbols,
         IReadOnlyList<string> filesHint,
         IReadOnlyList<string> constraints,
-        string scope)
+        string scope,
+        IReadOnlyList<string> targetHints)
     {
         var reasons = new List<InclusionReason>();
 
@@ -314,7 +161,9 @@ public sealed class ContextService : IContextService
         {
             var reason = filesHint.Any(f => (target.FilePath ?? string.Empty).Contains(f, StringComparison.OrdinalIgnoreCase))
                 ? "matched_by_file_hint"
-                : "matched_by_task_or_scope";
+                : targetHints.Any(h => target.SymbolKey.Contains(h, StringComparison.OrdinalIgnoreCase))
+                    ? "matched_by_symbol_name"
+                    : "matched_by_scope";
 
             reasons.Add(new InclusionReason(target.SymbolKey, reason));
         }
@@ -359,21 +208,17 @@ public sealed class ContextService : IContextService
         return Math.Round(Math.Clamp(score, 0.0, 0.99), 2);
     }
 
-    private static GetContextResponse BuildEmptyResponse(IReadOnlyList<string> intent, IReadOnlyList<string> constraints)
+    private static GetContextResponse BuildEmptyResponse(IReadOnlyList<string> intent, IReadOnlyList<string> constraintsApplied)
     {
         return new GetContextResponse(
             TaskIntent: intent,
             PrimaryTargets: Array.Empty<ContextTarget>(),
             RelatedSymbols: Array.Empty<RelatedSymbol>(),
-            ConstraintsApplied: constraints,
+            ConstraintsApplied: constraintsApplied,
             ProposedEdits: Array.Empty<ProposedEdit>(),
             Verification: ["dotnet build"],
             Freshness: new Freshness("unknown", DateTimeOffset.UtcNow),
             Confidence: 0.1,
             InclusionReasons: [new InclusionReason("request", "no_snapshot_found")]);
     }
-
-    private readonly record struct SnapshotInfo(long RunId, string CommitSha, DateTimeOffset IndexedAtUtc);
-
-    private readonly record struct SymbolCandidate(string SymbolKey, string Kind, string? FilePath, double Score);
 }
