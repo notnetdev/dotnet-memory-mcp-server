@@ -40,13 +40,91 @@ internal static class Program
             }
 
             Console.WriteLine("[info] PostgreSQL health-check: OK");
-            Console.WriteLine("[info] Stage 1 completed successfully.");
+            var schemaResult = await EnsureSchemaAsync(scanOptions.ConnectionString);
+            if (!schemaResult.Success)
+            {
+                Console.Error.WriteLine($"[error] Schema initialization failed: {schemaResult.Error}");
+                return DatabaseErrorExitCode;
+            }
+
+            Console.WriteLine("[info] Schema initialization: OK");
+            Console.WriteLine("[info] Stage 2 completed successfully.");
             return SuccessExitCode;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[error] Unexpected scanner failure: {ex.Message}");
             return UnexpectedErrorExitCode;
+        }
+    }
+
+    private static async Task<DatabasePingResult> EnsureSchemaAsync(string connectionString)
+    {
+        const string schemaSql = """
+                                 CREATE TABLE IF NOT EXISTS scan_runs
+                                 (
+                                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                                     repo_path TEXT NOT NULL,
+                                     commit_sha TEXT NOT NULL,
+                                     status TEXT NOT NULL,
+                                     started_at_utc TIMESTAMPTZ NOT NULL,
+                                     finished_at_utc TIMESTAMPTZ NULL,
+                                     error TEXT NULL
+                                 );
+
+                                 CREATE INDEX IF NOT EXISTS ix_scan_runs_repo_path_started_at
+                                     ON scan_runs (repo_path, started_at_utc DESC);
+
+                                 CREATE TABLE IF NOT EXISTS symbols
+                                 (
+                                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                                     scan_run_id BIGINT NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+                                     symbol_key TEXT NOT NULL,
+                                     kind TEXT NOT NULL,
+                                     name TEXT NOT NULL,
+                                     containing_type TEXT NULL,
+                                     namespace TEXT NULL,
+                                     file_path TEXT NULL
+                                 );
+
+                                 CREATE UNIQUE INDEX IF NOT EXISTS ux_symbols_scan_run_symbol_key
+                                     ON symbols (scan_run_id, symbol_key);
+
+                                 CREATE INDEX IF NOT EXISTS ix_symbols_scan_run_kind
+                                     ON symbols (scan_run_id, kind);
+
+                                 CREATE TABLE IF NOT EXISTS relations
+                                 (
+                                     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                                     scan_run_id BIGINT NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+                                     from_symbol_key TEXT NOT NULL,
+                                     relation_type TEXT NOT NULL,
+                                     to_symbol_key TEXT NOT NULL
+                                 );
+
+                                 CREATE INDEX IF NOT EXISTS ix_relations_scan_run_from
+                                     ON relations (scan_run_id, from_symbol_key);
+
+                                 CREATE INDEX IF NOT EXISTS ix_relations_scan_run_to
+                                     ON relations (scan_run_id, to_symbol_key);
+
+                                 CREATE INDEX IF NOT EXISTS ix_relations_scan_run_type
+                                     ON relations (scan_run_id, relation_type);
+                                 """;
+
+        try
+        {
+            await using var connection = new NpgsqlConnection(connectionString);
+            await connection.OpenAsync();
+
+            await using var command = new NpgsqlCommand(schemaSql, connection);
+            await command.ExecuteNonQueryAsync();
+
+            return DatabasePingResult.Ok();
+        }
+        catch (Exception ex)
+        {
+            return DatabasePingResult.Fail(ex.Message);
         }
     }
 
