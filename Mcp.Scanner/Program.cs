@@ -9,6 +9,8 @@ namespace Mcp.Scanner;
 
 internal static class Program
 {
+    private const int CommandTimeoutSeconds = 120;
+
     private const int SuccessExitCode = 0;
     private const int InvalidArgumentsExitCode = 1;
     private const int DatabaseErrorExitCode = 2;
@@ -24,6 +26,14 @@ internal static class Program
 
     public static async Task<int> Main(string[] args)
     {
+        using var shutdownCts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            shutdownCts.Cancel();
+            Console.Error.WriteLine("[warn] Cancellation requested (Ctrl+C). Finishing current safe point...");
+        };
+
         try
         {
             if (args.Length == 0)
@@ -44,7 +54,7 @@ internal static class Program
                     return InvalidArgumentsExitCode;
                 }
 
-                var reportResult = await ExecuteReportAsync(reportOptions);
+                var reportResult = await ExecuteReportAsync(reportOptions, shutdownCts.Token);
                 if (!reportResult.Success)
                 {
                     Console.Error.WriteLine($"[error] Stage 6 report failed: {reportResult.Error}");
@@ -67,7 +77,7 @@ internal static class Program
             Console.WriteLine($"[info] Repo: {scanOptions.RepoPath}");
             Console.WriteLine($"[info] Commit: {scanOptions.CommitSha}");
 
-            var pingResult = await CheckDatabaseConnectionAsync(scanOptions.ConnectionString);
+            var pingResult = await CheckDatabaseConnectionAsync(scanOptions.ConnectionString, shutdownCts.Token);
             if (!pingResult.Success)
             {
                 Console.Error.WriteLine($"[error] PostgreSQL health-check failed: {pingResult.Error}");
@@ -75,7 +85,7 @@ internal static class Program
             }
 
             Console.WriteLine("[info] PostgreSQL health-check: OK");
-            var schemaResult = await EnsureSchemaAsync(scanOptions.ConnectionString);
+            var schemaResult = await EnsureSchemaAsync(scanOptions.ConnectionString, shutdownCts.Token);
             if (!schemaResult.Success)
             {
                 Console.Error.WriteLine($"[error] Schema initialization failed: {schemaResult.Error}");
@@ -84,7 +94,7 @@ internal static class Program
 
             Console.WriteLine("[info] Schema initialization: OK");
 
-            var scanResult = await ExecuteSymbolScanAsync(scanOptions);
+            var scanResult = await ExecuteSymbolScanAsync(scanOptions, shutdownCts.Token);
             if (!scanResult.Success)
             {
                 Console.Error.WriteLine($"[error] Stage 5 scan failed: {scanResult.Error}");
@@ -97,14 +107,19 @@ internal static class Program
             Console.WriteLine("[info] Stage 5 completed successfully.");
             return SuccessExitCode;
         }
+        catch (OperationCanceledException)
+        {
+            Console.Error.WriteLine("[error] Scanner execution cancelled.");
+            return UnexpectedErrorExitCode;
+        }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[error] Unexpected scanner failure: {ex.Message}");
+            Console.Error.WriteLine($"[error] Unexpected scanner failure: {DescribeException(ex)}");
             return UnexpectedErrorExitCode;
         }
     }
 
-    private static async Task<SymbolScanResult> ExecuteSymbolScanAsync(ScanOptions options)
+    private static async Task<SymbolScanResult> ExecuteSymbolScanAsync(ScanOptions options, CancellationToken cancellationToken)
     {
         long? scanRunId = null;
         var stopwatch = Stopwatch.StartNew();
@@ -114,23 +129,27 @@ internal static class Program
             EnsureMsBuildRegistered();
 
             await using var connection = new NpgsqlConnection(options.ConnectionString);
-            await connection.OpenAsync();
+            await connection.OpenAsync(cancellationToken);
 
-            scanRunId = await CreateScanRunAsync(connection, options);
+            scanRunId = await CreateScanRunAsync(connection, options, cancellationToken);
             var currentScanRunId = scanRunId.Value;
 
-            var extraction = await ExtractFactsAsync(options.SolutionPath);
+            var extraction = await ExtractFactsAsync(options.SolutionPath, cancellationToken);
 
             var symbols = extraction.Symbols;
             var relations = extraction.Relations;
             var metrics = new ScanMetrics(extraction.ProjectsCount, extraction.FilesCount, symbols.Count, relations.Count, stopwatch.ElapsedMilliseconds);
 
-            await InsertSymbolsAsync(connection, currentScanRunId, symbols);
-            await InsertRelationsAsync(connection, currentScanRunId, relations);
+            await using var writeTransaction = await connection.BeginTransactionAsync(cancellationToken);
 
-            await CompleteScanRunAsync(connection, currentScanRunId, status: "succeeded", error: null, metrics);
+            await InsertSymbolsAsync(connection, currentScanRunId, symbols, writeTransaction, cancellationToken);
+            await InsertRelationsAsync(connection, currentScanRunId, relations, writeTransaction, cancellationToken);
 
-            var latestSuccessfulRunId = await GetLatestSuccessfulScanRunIdAsync(connection, options.RepoPath);
+            await CompleteScanRunAsync(connection, currentScanRunId, status: "succeeded", error: null, metrics, writeTransaction, cancellationToken);
+
+            await writeTransaction.CommitAsync(cancellationToken);
+
+            var latestSuccessfulRunId = await GetLatestSuccessfulScanRunIdAsync(connection, options.RepoPath, cancellationToken);
             return SymbolScanResult.Ok(currentScanRunId, metrics, latestSuccessfulRunId);
         }
         catch (Exception ex)
@@ -140,8 +159,8 @@ internal static class Program
                 try
                 {
                     await using var failConnection = new NpgsqlConnection(options.ConnectionString);
-                    await failConnection.OpenAsync();
-                    await CompleteScanRunAsync(failConnection, scanRunId.Value, status: "failed", error: ex.Message, metrics: null);
+                    await failConnection.OpenAsync(CancellationToken.None);
+                    await CompleteScanRunAsync(failConnection, scanRunId.Value, status: "failed", error: DescribeException(ex), metrics: null, transaction: null, CancellationToken.None);
                 }
                 catch
                 {
@@ -149,7 +168,7 @@ internal static class Program
                 }
             }
 
-            return SymbolScanResult.Fail(ex.Message);
+            return SymbolScanResult.Fail(DescribeException(ex));
         }
     }
 
@@ -161,7 +180,7 @@ internal static class Program
         }
     }
 
-    private static async Task<long> CreateScanRunAsync(NpgsqlConnection connection, ScanOptions options)
+    private static async Task<long> CreateScanRunAsync(NpgsqlConnection connection, ScanOptions options, CancellationToken cancellationToken)
     {
         const string sql = """
                            INSERT INTO scan_runs (repo_path, commit_sha, status, started_at_utc)
@@ -170,12 +189,13 @@ internal static class Program
                            """;
 
         await using var command = new NpgsqlCommand(sql, connection);
+        command.CommandTimeout = CommandTimeoutSeconds;
         command.Parameters.AddWithValue("repo_path", options.RepoPath);
         command.Parameters.AddWithValue("commit_sha", options.CommitSha);
         command.Parameters.AddWithValue("status", "running");
         command.Parameters.AddWithValue("started_at_utc", DateTimeOffset.UtcNow);
 
-        var result = await command.ExecuteScalarAsync();
+        var result = await command.ExecuteScalarAsync(cancellationToken);
         return Convert.ToInt64(result);
     }
 
@@ -184,7 +204,9 @@ internal static class Program
         long scanRunId,
         string status,
         string? error,
-        ScanMetrics? metrics)
+        ScanMetrics? metrics,
+        NpgsqlTransaction? transaction,
+        CancellationToken cancellationToken)
     {
         const string sql = """
                            UPDATE scan_runs
@@ -200,6 +222,8 @@ internal static class Program
                            """;
 
         await using var command = new NpgsqlCommand(sql, connection);
+        command.CommandTimeout = CommandTimeoutSeconds;
+        command.Transaction = transaction;
         command.Parameters.AddWithValue("status", status);
         command.Parameters.AddWithValue("finished_at_utc", DateTimeOffset.UtcNow);
         command.Parameters.AddWithValue("error", (object?)error ?? DBNull.Value);
@@ -209,10 +233,10 @@ internal static class Program
         command.Parameters.AddWithValue("relations_count", metrics?.RelationsCount is null ? DBNull.Value : metrics.Value.RelationsCount);
         command.Parameters.AddWithValue("duration_ms", metrics?.DurationMs is null ? DBNull.Value : metrics.Value.DurationMs);
         command.Parameters.AddWithValue("id", scanRunId);
-        await command.ExecuteNonQueryAsync();
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static async Task<long?> GetLatestSuccessfulScanRunIdAsync(NpgsqlConnection connection, string repoPath)
+    private static async Task<long?> GetLatestSuccessfulScanRunIdAsync(NpgsqlConnection connection, string repoPath, CancellationToken cancellationToken)
     {
         const string sql = """
                            SELECT id
@@ -221,9 +245,10 @@ internal static class Program
                            """;
 
         await using var command = new NpgsqlCommand(sql, connection);
+        command.CommandTimeout = CommandTimeoutSeconds;
         command.Parameters.AddWithValue("repo_path", repoPath);
 
-        var result = await command.ExecuteScalarAsync();
+        var result = await command.ExecuteScalarAsync(cancellationToken);
         if (result is null or DBNull)
         {
             return null;
@@ -232,10 +257,10 @@ internal static class Program
         return Convert.ToInt64(result);
     }
 
-    private static async Task<ExtractionResult> ExtractFactsAsync(string solutionPath)
+    private static async Task<ExtractionResult> ExtractFactsAsync(string solutionPath, CancellationToken cancellationToken)
     {
         using var workspace = MSBuildWorkspace.Create();
-        var solution = await workspace.OpenSolutionAsync(solutionPath);
+        var solution = await workspace.OpenSolutionAsync(solutionPath, cancellationToken: cancellationToken);
 
         var extractedSymbols = new List<ExtractedSymbol>();
         var extractedRelations = new List<ExtractedRelation>();
@@ -244,6 +269,7 @@ internal static class Program
 
         foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             projectsCount++;
 
             foreach (var document in project.Documents)
@@ -259,7 +285,7 @@ internal static class Program
                     continue;
                 }
 
-                var semanticModel = await document.GetSemanticModelAsync();
+                var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
                 if (semanticModel is null)
                 {
                     continue;
@@ -273,6 +299,7 @@ internal static class Program
 
                 foreach (var node in syntaxRoot.DescendantNodes())
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var typeSymbol = node switch
                     {
                         ClassDeclarationSyntax classDecl => semanticModel.GetDeclaredSymbol(classDecl) as INamedTypeSymbol,
@@ -325,15 +352,15 @@ internal static class Program
         return new ExtractionResult(distinctSymbols, distinctRelations, projectsCount, files.Count);
     }
 
-    private static async Task<ReportResult> ExecuteReportAsync(ReportOptions options)
+    private static async Task<ReportResult> ExecuteReportAsync(ReportOptions options, CancellationToken cancellationToken)
     {
-        var pingResult = await CheckDatabaseConnectionAsync(options.ConnectionString);
+        var pingResult = await CheckDatabaseConnectionAsync(options.ConnectionString, cancellationToken);
         if (!pingResult.Success)
         {
             return ReportResult.Fail($"PostgreSQL health-check failed: {pingResult.Error}", isDatabaseError: true);
         }
 
-        var schemaResult = await EnsureSchemaAsync(options.ConnectionString);
+        var schemaResult = await EnsureSchemaAsync(options.ConnectionString, cancellationToken);
         if (!schemaResult.Success)
         {
             return ReportResult.Fail($"Schema initialization failed: {schemaResult.Error}", isDatabaseError: true);
@@ -357,13 +384,14 @@ internal static class Program
         try
         {
             await using var connection = new NpgsqlConnection(options.ConnectionString);
-            await connection.OpenAsync();
+            await connection.OpenAsync(cancellationToken);
 
             await using var command = new NpgsqlCommand(sql, connection);
+            command.CommandTimeout = CommandTimeoutSeconds;
             command.Parameters.AddWithValue("repo_path", options.RepoPath);
 
-            await using var reader = await command.ExecuteReaderAsync();
-            if (!await reader.ReadAsync())
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
             {
                 return ReportResult.Fail($"No successful scan snapshot found for repo: {options.RepoPath}", isDatabaseError: false);
             }
@@ -384,7 +412,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            return ReportResult.Fail(ex.Message, isDatabaseError: true);
+            return ReportResult.Fail(DescribeException(ex), isDatabaseError: true);
         }
     }
 
@@ -403,7 +431,22 @@ internal static class Program
         Console.WriteLine($"[info] DurationMs: {report.DurationMs}");
     }
 
-    private static async Task InsertSymbolsAsync(NpgsqlConnection connection, long scanRunId, IReadOnlyCollection<ExtractedSymbol> symbols)
+    private static string DescribeException(Exception ex)
+        => ex switch
+        {
+            OperationCanceledException => "Operation cancelled.",
+            PostgresException pg => $"PostgreSQL error (SQLSTATE {pg.SqlState}): {pg.MessageText}",
+            InvalidOperationException invalidOp when invalidOp.Message.Contains("MSBuild", StringComparison.OrdinalIgnoreCase)
+                => "MSBuild/Roslyn initialization failed. Ensure .NET SDK and workload are installed and solution builds locally.",
+            _ => ex.Message
+        };
+
+    private static async Task InsertSymbolsAsync(
+        NpgsqlConnection connection,
+        long scanRunId,
+        IReadOnlyCollection<ExtractedSymbol> symbols,
+        NpgsqlTransaction transaction,
+        CancellationToken cancellationToken)
     {
         const string sql = """
                            INSERT INTO symbols (scan_run_id, symbol_key, kind, name, containing_type, "namespace", file_path)
@@ -413,7 +456,10 @@ internal static class Program
 
         foreach (var symbol in symbols)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             await using var command = new NpgsqlCommand(sql, connection);
+            command.CommandTimeout = CommandTimeoutSeconds;
+            command.Transaction = transaction;
             command.Parameters.AddWithValue("scan_run_id", scanRunId);
             command.Parameters.AddWithValue("symbol_key", symbol.SymbolKey);
             command.Parameters.AddWithValue("kind", symbol.Kind);
@@ -421,11 +467,16 @@ internal static class Program
             command.Parameters.AddWithValue("containing_type", (object?)symbol.ContainingType ?? DBNull.Value);
             command.Parameters.AddWithValue("namespace", (object?)symbol.Namespace ?? DBNull.Value);
             command.Parameters.AddWithValue("file_path", (object?)symbol.FilePath ?? DBNull.Value);
-            await command.ExecuteNonQueryAsync();
+            await command.ExecuteNonQueryAsync(cancellationToken);
         }
     }
 
-    private static async Task InsertRelationsAsync(NpgsqlConnection connection, long scanRunId, IReadOnlyCollection<ExtractedRelation> relations)
+    private static async Task InsertRelationsAsync(
+        NpgsqlConnection connection,
+        long scanRunId,
+        IReadOnlyCollection<ExtractedRelation> relations,
+        NpgsqlTransaction transaction,
+        CancellationToken cancellationToken)
     {
         const string sql = """
                            INSERT INTO relations (scan_run_id, from_symbol_key, relation_type, to_symbol_key)
@@ -435,16 +486,19 @@ internal static class Program
 
         foreach (var relation in relations)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             await using var command = new NpgsqlCommand(sql, connection);
+            command.CommandTimeout = CommandTimeoutSeconds;
+            command.Transaction = transaction;
             command.Parameters.AddWithValue("scan_run_id", scanRunId);
             command.Parameters.AddWithValue("from_symbol_key", relation.FromSymbolKey);
             command.Parameters.AddWithValue("relation_type", relation.RelationType);
             command.Parameters.AddWithValue("to_symbol_key", relation.ToSymbolKey);
-            await command.ExecuteNonQueryAsync();
+            await command.ExecuteNonQueryAsync(cancellationToken);
         }
     }
 
-    private static async Task<DatabasePingResult> EnsureSchemaAsync(string connectionString)
+    private static async Task<DatabasePingResult> EnsureSchemaAsync(string connectionString, CancellationToken cancellationToken)
     {
         const string schemaSql = """
                                  CREATE TABLE IF NOT EXISTS scan_runs
@@ -536,34 +590,44 @@ internal static class Program
         try
         {
             await using var connection = new NpgsqlConnection(connectionString);
-            await connection.OpenAsync();
+            await connection.OpenAsync(cancellationToken);
 
             await using var command = new NpgsqlCommand(schemaSql, connection);
-            await command.ExecuteNonQueryAsync();
+            command.CommandTimeout = CommandTimeoutSeconds;
+            await command.ExecuteNonQueryAsync(cancellationToken);
 
             return DatabasePingResult.Ok();
         }
+        catch (OperationCanceledException)
+        {
+            return DatabasePingResult.Fail("Operation cancelled.");
+        }
         catch (Exception ex)
         {
-            return DatabasePingResult.Fail(ex.Message);
+            return DatabasePingResult.Fail(DescribeException(ex));
         }
     }
 
-    private static async Task<DatabasePingResult> CheckDatabaseConnectionAsync(string connectionString)
+    private static async Task<DatabasePingResult> CheckDatabaseConnectionAsync(string connectionString, CancellationToken cancellationToken)
     {
         try
         {
             await using var connection = new NpgsqlConnection(connectionString);
-            await connection.OpenAsync();
+            await connection.OpenAsync(cancellationToken);
 
             await using var command = new NpgsqlCommand("SELECT 1", connection);
-            await command.ExecuteScalarAsync();
+            command.CommandTimeout = CommandTimeoutSeconds;
+            await command.ExecuteScalarAsync(cancellationToken);
 
             return DatabasePingResult.Ok();
         }
+        catch (OperationCanceledException)
+        {
+            return DatabasePingResult.Fail("Operation cancelled.");
+        }
         catch (Exception ex)
         {
-            return DatabasePingResult.Fail(ex.Message);
+            return DatabasePingResult.Fail(DescribeException(ex));
         }
     }
 
