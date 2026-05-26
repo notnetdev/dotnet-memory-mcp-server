@@ -1,4 +1,8 @@
 ﻿using Npgsql;
+using Microsoft.Build.Locator;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.MSBuild;
 
 namespace Mcp.Scanner;
 
@@ -48,13 +52,173 @@ internal static class Program
             }
 
             Console.WriteLine("[info] Schema initialization: OK");
-            Console.WriteLine("[info] Stage 2 completed successfully.");
+
+            var scanResult = await ExecuteSymbolScanAsync(scanOptions);
+            if (!scanResult.Success)
+            {
+                Console.Error.WriteLine($"[error] Stage 3 symbol scan failed: {scanResult.Error}");
+                return UnexpectedErrorExitCode;
+            }
+
+            Console.WriteLine($"[info] Stage 3 symbol scan: OK (runId={scanResult.ScanRunId}, symbols={scanResult.SymbolsCount})");
+            Console.WriteLine("[info] Stage 3 completed successfully.");
             return SuccessExitCode;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[error] Unexpected scanner failure: {ex.Message}");
             return UnexpectedErrorExitCode;
+        }
+    }
+
+    private static async Task<SymbolScanResult> ExecuteSymbolScanAsync(ScanOptions options)
+    {
+        try
+        {
+            EnsureMsBuildRegistered();
+
+            await using var connection = new NpgsqlConnection(options.ConnectionString);
+            await connection.OpenAsync();
+
+            var scanRunId = await CreateScanRunAsync(connection, options);
+
+            var symbols = await ExtractSymbolsAsync(options.SolutionPath);
+            await InsertSymbolsAsync(connection, scanRunId, symbols);
+
+            await CompleteScanRunAsync(connection, scanRunId, status: "succeeded", error: null);
+            return SymbolScanResult.Ok(scanRunId, symbols.Count);
+        }
+        catch (Exception ex)
+        {
+            return SymbolScanResult.Fail(ex.Message);
+        }
+    }
+
+    private static void EnsureMsBuildRegistered()
+    {
+        if (!MSBuildLocator.IsRegistered)
+        {
+            MSBuildLocator.RegisterDefaults();
+        }
+    }
+
+    private static async Task<long> CreateScanRunAsync(NpgsqlConnection connection, ScanOptions options)
+    {
+        const string sql = """
+                           INSERT INTO scan_runs (repo_path, commit_sha, status, started_at_utc)
+                           VALUES (@repo_path, @commit_sha, @status, @started_at_utc)
+                           RETURNING id;
+                           """;
+
+        await using var command = new NpgsqlCommand(sql, connection);
+        command.Parameters.AddWithValue("repo_path", options.RepoPath);
+        command.Parameters.AddWithValue("commit_sha", options.CommitSha);
+        command.Parameters.AddWithValue("status", "running");
+        command.Parameters.AddWithValue("started_at_utc", DateTimeOffset.UtcNow);
+
+        var result = await command.ExecuteScalarAsync();
+        return Convert.ToInt64(result);
+    }
+
+    private static async Task CompleteScanRunAsync(NpgsqlConnection connection, long scanRunId, string status, string? error)
+    {
+        const string sql = """
+                           UPDATE scan_runs
+                           SET status = @status,
+                               finished_at_utc = @finished_at_utc,
+                               error = @error
+                           WHERE id = @id;
+                           """;
+
+        await using var command = new NpgsqlCommand(sql, connection);
+        command.Parameters.AddWithValue("status", status);
+        command.Parameters.AddWithValue("finished_at_utc", DateTimeOffset.UtcNow);
+        command.Parameters.AddWithValue("error", (object?)error ?? DBNull.Value);
+        command.Parameters.AddWithValue("id", scanRunId);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<List<ExtractedSymbol>> ExtractSymbolsAsync(string solutionPath)
+    {
+        using var workspace = MSBuildWorkspace.Create();
+        var solution = await workspace.OpenSolutionAsync(solutionPath);
+
+        var extracted = new List<ExtractedSymbol>();
+
+        foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
+        {
+            foreach (var document in project.Documents)
+            {
+                if (!document.SupportsSyntaxTree)
+                {
+                    continue;
+                }
+
+                var syntaxRoot = await document.GetSyntaxRootAsync();
+                if (syntaxRoot is null)
+                {
+                    continue;
+                }
+
+                var semanticModel = await document.GetSemanticModelAsync();
+                if (semanticModel is null)
+                {
+                    continue;
+                }
+
+                var filePath = document.FilePath;
+
+                foreach (var node in syntaxRoot.DescendantNodes())
+                {
+                    var typeSymbol = node switch
+                    {
+                        ClassDeclarationSyntax classDecl => semanticModel.GetDeclaredSymbol(classDecl) as INamedTypeSymbol,
+                        InterfaceDeclarationSyntax interfaceDecl => semanticModel.GetDeclaredSymbol(interfaceDecl) as INamedTypeSymbol,
+                        _ => null
+                    };
+
+                    if (typeSymbol is not null)
+                    {
+                        extracted.Add(ExtractedSymbol.From(typeSymbol, filePath));
+                        continue;
+                    }
+
+                    if (node is MethodDeclarationSyntax methodDecl)
+                    {
+                        var methodSymbol = semanticModel.GetDeclaredSymbol(methodDecl) as IMethodSymbol;
+                        if (methodSymbol is not null)
+                        {
+                            extracted.Add(ExtractedSymbol.From(methodSymbol, filePath));
+                        }
+                    }
+                }
+            }
+        }
+
+        return extracted
+            .DistinctBy(s => s.SymbolKey)
+            .ToList();
+    }
+
+    private static async Task InsertSymbolsAsync(NpgsqlConnection connection, long scanRunId, IReadOnlyCollection<ExtractedSymbol> symbols)
+    {
+        const string sql = """
+                           INSERT INTO symbols (scan_run_id, symbol_key, kind, name, containing_type, "namespace", file_path)
+                           VALUES (@scan_run_id, @symbol_key, @kind, @name, @containing_type, @namespace, @file_path)
+                           ON CONFLICT (scan_run_id, symbol_key) DO NOTHING;
+                           """;
+
+        foreach (var symbol in symbols)
+        {
+            await using var command = new NpgsqlCommand(sql, connection);
+            command.Parameters.AddWithValue("scan_run_id", scanRunId);
+            command.Parameters.AddWithValue("symbol_key", symbol.SymbolKey);
+            command.Parameters.AddWithValue("kind", symbol.Kind);
+            command.Parameters.AddWithValue("name", symbol.Name);
+            command.Parameters.AddWithValue("containing_type", (object?)symbol.ContainingType ?? DBNull.Value);
+            command.Parameters.AddWithValue("namespace", (object?)symbol.Namespace ?? DBNull.Value);
+            command.Parameters.AddWithValue("file_path", (object?)symbol.FilePath ?? DBNull.Value);
+            await command.ExecuteNonQueryAsync();
         }
     }
 
@@ -289,5 +453,43 @@ internal static class Program
     {
         public static DatabasePingResult Ok() => new(true, null);
         public static DatabasePingResult Fail(string error) => new(false, error);
+    }
+
+    private readonly record struct SymbolScanResult(bool Success, long ScanRunId, int SymbolsCount, string? Error)
+    {
+        public static SymbolScanResult Ok(long scanRunId, int symbolsCount) => new(true, scanRunId, symbolsCount, null);
+        public static SymbolScanResult Fail(string error) => new(false, 0, 0, error);
+    }
+
+    private sealed record ExtractedSymbol(
+        string SymbolKey,
+        string Kind,
+        string Name,
+        string? ContainingType,
+        string? Namespace,
+        string? FilePath)
+    {
+        public static ExtractedSymbol From(INamedTypeSymbol symbol, string? filePath)
+            => new(
+                SymbolKey: symbol.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat),
+                Kind: symbol.TypeKind switch
+                {
+                    TypeKind.Interface => "interface",
+                    TypeKind.Class => "class",
+                    _ => "type"
+                },
+                Name: symbol.Name,
+                ContainingType: symbol.ContainingType?.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat),
+                Namespace: symbol.ContainingNamespace?.ToDisplayString(),
+                FilePath: filePath);
+
+        public static ExtractedSymbol From(IMethodSymbol symbol, string? filePath)
+            => new(
+                SymbolKey: symbol.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat),
+                Kind: "method",
+                Name: symbol.Name,
+                ContainingType: symbol.ContainingType?.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat),
+                Namespace: symbol.ContainingNamespace?.ToDisplayString(),
+                FilePath: filePath);
     }
 }
