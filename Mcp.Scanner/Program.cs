@@ -56,12 +56,12 @@ internal static class Program
             var scanResult = await ExecuteSymbolScanAsync(scanOptions);
             if (!scanResult.Success)
             {
-                Console.Error.WriteLine($"[error] Stage 3 symbol scan failed: {scanResult.Error}");
+                Console.Error.WriteLine($"[error] Stage 4 scan failed: {scanResult.Error}");
                 return UnexpectedErrorExitCode;
             }
 
-            Console.WriteLine($"[info] Stage 3 symbol scan: OK (runId={scanResult.ScanRunId}, symbols={scanResult.SymbolsCount})");
-            Console.WriteLine("[info] Stage 3 completed successfully.");
+            Console.WriteLine($"[info] Stage 4 scan: OK (runId={scanResult.ScanRunId}, symbols={scanResult.SymbolsCount}, relations={scanResult.RelationsCount})");
+            Console.WriteLine("[info] Stage 4 completed successfully.");
             return SuccessExitCode;
         }
         catch (Exception ex)
@@ -82,11 +82,16 @@ internal static class Program
 
             var scanRunId = await CreateScanRunAsync(connection, options);
 
-            var symbols = await ExtractSymbolsAsync(options.SolutionPath);
+            var extraction = await ExtractFactsAsync(options.SolutionPath);
+
+            var symbols = extraction.Symbols;
+            var relations = extraction.Relations;
+
             await InsertSymbolsAsync(connection, scanRunId, symbols);
+            await InsertRelationsAsync(connection, scanRunId, relations);
 
             await CompleteScanRunAsync(connection, scanRunId, status: "succeeded", error: null);
-            return SymbolScanResult.Ok(scanRunId, symbols.Count);
+            return SymbolScanResult.Ok(scanRunId, symbols.Count, relations.Count);
         }
         catch (Exception ex)
         {
@@ -138,12 +143,13 @@ internal static class Program
         await command.ExecuteNonQueryAsync();
     }
 
-    private static async Task<List<ExtractedSymbol>> ExtractSymbolsAsync(string solutionPath)
+    private static async Task<ExtractionResult> ExtractFactsAsync(string solutionPath)
     {
         using var workspace = MSBuildWorkspace.Create();
         var solution = await workspace.OpenSolutionAsync(solutionPath);
 
-        var extracted = new List<ExtractedSymbol>();
+        var extractedSymbols = new List<ExtractedSymbol>();
+        var extractedRelations = new List<ExtractedRelation>();
 
         foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
         {
@@ -179,7 +185,18 @@ internal static class Program
 
                     if (typeSymbol is not null)
                     {
-                        extracted.Add(ExtractedSymbol.From(typeSymbol, filePath));
+                        extractedSymbols.Add(ExtractedSymbol.From(typeSymbol, filePath));
+
+                        if (!string.IsNullOrWhiteSpace(filePath))
+                        {
+                            extractedRelations.Add(ExtractedRelation.SymbolDeclaredInFile(typeSymbol, filePath));
+                        }
+
+                        foreach (var implementedInterface in typeSymbol.Interfaces)
+                        {
+                            extractedRelations.Add(ExtractedRelation.Implements(typeSymbol, implementedInterface));
+                        }
+
                         continue;
                     }
 
@@ -188,16 +205,27 @@ internal static class Program
                         var methodSymbol = semanticModel.GetDeclaredSymbol(methodDecl) as IMethodSymbol;
                         if (methodSymbol is not null)
                         {
-                            extracted.Add(ExtractedSymbol.From(methodSymbol, filePath));
+                            extractedSymbols.Add(ExtractedSymbol.From(methodSymbol, filePath));
+
+                            if (!string.IsNullOrWhiteSpace(filePath))
+                            {
+                                extractedRelations.Add(ExtractedRelation.SymbolDeclaredInFile(methodSymbol, filePath));
+                            }
                         }
                     }
                 }
             }
         }
 
-        return extracted
+        var distinctSymbols = extractedSymbols
             .DistinctBy(s => s.SymbolKey)
             .ToList();
+
+        var distinctRelations = extractedRelations
+            .DistinctBy(r => (r.FromSymbolKey, r.RelationType, r.ToSymbolKey))
+            .ToList();
+
+        return new ExtractionResult(distinctSymbols, distinctRelations);
     }
 
     private static async Task InsertSymbolsAsync(NpgsqlConnection connection, long scanRunId, IReadOnlyCollection<ExtractedSymbol> symbols)
@@ -218,6 +246,25 @@ internal static class Program
             command.Parameters.AddWithValue("containing_type", (object?)symbol.ContainingType ?? DBNull.Value);
             command.Parameters.AddWithValue("namespace", (object?)symbol.Namespace ?? DBNull.Value);
             command.Parameters.AddWithValue("file_path", (object?)symbol.FilePath ?? DBNull.Value);
+            await command.ExecuteNonQueryAsync();
+        }
+    }
+
+    private static async Task InsertRelationsAsync(NpgsqlConnection connection, long scanRunId, IReadOnlyCollection<ExtractedRelation> relations)
+    {
+        const string sql = """
+                           INSERT INTO relations (scan_run_id, from_symbol_key, relation_type, to_symbol_key)
+                           VALUES (@scan_run_id, @from_symbol_key, @relation_type, @to_symbol_key)
+                           ON CONFLICT (scan_run_id, from_symbol_key, relation_type, to_symbol_key) DO NOTHING;
+                           """;
+
+        foreach (var relation in relations)
+        {
+            await using var command = new NpgsqlCommand(sql, connection);
+            command.Parameters.AddWithValue("scan_run_id", scanRunId);
+            command.Parameters.AddWithValue("from_symbol_key", relation.FromSymbolKey);
+            command.Parameters.AddWithValue("relation_type", relation.RelationType);
+            command.Parameters.AddWithValue("to_symbol_key", relation.ToSymbolKey);
             await command.ExecuteNonQueryAsync();
         }
     }
@@ -265,6 +312,9 @@ internal static class Program
                                      relation_type TEXT NOT NULL,
                                      to_symbol_key TEXT NOT NULL
                                  );
+
+                                 CREATE UNIQUE INDEX IF NOT EXISTS ux_relations_scan_run_from_type_to
+                                     ON relations (scan_run_id, from_symbol_key, relation_type, to_symbol_key);
 
                                  CREATE INDEX IF NOT EXISTS ix_relations_scan_run_from
                                      ON relations (scan_run_id, from_symbol_key);
@@ -455,11 +505,18 @@ internal static class Program
         public static DatabasePingResult Fail(string error) => new(false, error);
     }
 
-    private readonly record struct SymbolScanResult(bool Success, long ScanRunId, int SymbolsCount, string? Error)
+    private readonly record struct SymbolScanResult(bool Success, long ScanRunId, int SymbolsCount, int RelationsCount, string? Error)
     {
-        public static SymbolScanResult Ok(long scanRunId, int symbolsCount) => new(true, scanRunId, symbolsCount, null);
-        public static SymbolScanResult Fail(string error) => new(false, 0, 0, error);
+        public static SymbolScanResult Ok(long scanRunId, int symbolsCount, int relationsCount)
+            => new(true, scanRunId, symbolsCount, relationsCount, null);
+
+        public static SymbolScanResult Fail(string error)
+            => new(false, 0, 0, 0, error);
     }
+
+    private readonly record struct ExtractionResult(
+        IReadOnlyCollection<ExtractedSymbol> Symbols,
+        IReadOnlyCollection<ExtractedRelation> Relations);
 
     private sealed record ExtractedSymbol(
         string SymbolKey,
@@ -491,5 +548,20 @@ internal static class Program
                 ContainingType: symbol.ContainingType?.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat),
                 Namespace: symbol.ContainingNamespace?.ToDisplayString(),
                 FilePath: filePath);
+    }
+
+    private sealed record ExtractedRelation(string FromSymbolKey, string RelationType, string ToSymbolKey)
+    {
+        public static ExtractedRelation Implements(INamedTypeSymbol implementation, INamedTypeSymbol abstraction)
+            => new(
+                FromSymbolKey: implementation.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat),
+                RelationType: "implements",
+                ToSymbolKey: abstraction.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat));
+
+        public static ExtractedRelation SymbolDeclaredInFile(ISymbol symbol, string filePath)
+            => new(
+                FromSymbolKey: symbol.ToDisplayString(SymbolDisplayFormat.CSharpErrorMessageFormat),
+                RelationType: "declared_in_file",
+                ToSymbolKey: $"file:{filePath}");
     }
 }
