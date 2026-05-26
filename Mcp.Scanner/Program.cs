@@ -3,6 +3,7 @@ using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.MSBuild;
+using System.Diagnostics;
 
 namespace Mcp.Scanner;
 
@@ -14,6 +15,7 @@ internal static class Program
     private const int UnexpectedErrorExitCode = 99;
 
     private const string ScanCommand = "scan";
+    private const string ReportCommand = "report";
     private const string SolutionArg = "--solution";
     private const string RepoArg = "--repo";
     private const string CommitArg = "--commit";
@@ -24,6 +26,35 @@ internal static class Program
     {
         try
         {
+            if (args.Length == 0)
+            {
+                Console.Error.WriteLine("[error] Command is required.");
+                PrintUsage();
+                return InvalidArgumentsExitCode;
+            }
+
+            var command = args[0];
+
+            if (string.Equals(command, ReportCommand, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!TryParseReportArguments(args, out var reportOptions, out var reportValidationError))
+                {
+                    Console.Error.WriteLine($"[error] {reportValidationError}");
+                    PrintUsage();
+                    return InvalidArgumentsExitCode;
+                }
+
+                var reportResult = await ExecuteReportAsync(reportOptions);
+                if (!reportResult.Success)
+                {
+                    Console.Error.WriteLine($"[error] Stage 6 report failed: {reportResult.Error}");
+                    return reportResult.IsDatabaseError ? DatabaseErrorExitCode : InvalidArgumentsExitCode;
+                }
+
+                Console.WriteLine("[info] Stage 6 report completed successfully.");
+                return SuccessExitCode;
+            }
+
             if (!TryParseArguments(args, out var scanOptions, out var validationError))
             {
                 Console.Error.WriteLine($"[error] {validationError}");
@@ -62,6 +93,7 @@ internal static class Program
 
             Console.WriteLine($"[info] Stage 5 scan: OK (runId={scanResult.ScanRunId}, symbols={scanResult.SymbolsCount}, relations={scanResult.RelationsCount})");
             Console.WriteLine($"[info] Latest successful snapshot for repo: {scanResult.LatestSuccessfulScanRunId}");
+            Console.WriteLine($"[info] Scan summary: projects={scanResult.ProjectsCount}, files={scanResult.FilesCount}, durationMs={scanResult.DurationMs}");
             Console.WriteLine("[info] Stage 5 completed successfully.");
             return SuccessExitCode;
         }
@@ -75,6 +107,7 @@ internal static class Program
     private static async Task<SymbolScanResult> ExecuteSymbolScanAsync(ScanOptions options)
     {
         long? scanRunId = null;
+        var stopwatch = Stopwatch.StartNew();
 
         try
         {
@@ -90,14 +123,15 @@ internal static class Program
 
             var symbols = extraction.Symbols;
             var relations = extraction.Relations;
+            var metrics = new ScanMetrics(extraction.ProjectsCount, extraction.FilesCount, symbols.Count, relations.Count, stopwatch.ElapsedMilliseconds);
 
             await InsertSymbolsAsync(connection, currentScanRunId, symbols);
             await InsertRelationsAsync(connection, currentScanRunId, relations);
 
-            await CompleteScanRunAsync(connection, currentScanRunId, status: "succeeded", error: null);
+            await CompleteScanRunAsync(connection, currentScanRunId, status: "succeeded", error: null, metrics);
 
             var latestSuccessfulRunId = await GetLatestSuccessfulScanRunIdAsync(connection, options.RepoPath);
-            return SymbolScanResult.Ok(currentScanRunId, symbols.Count, relations.Count, latestSuccessfulRunId);
+            return SymbolScanResult.Ok(currentScanRunId, metrics, latestSuccessfulRunId);
         }
         catch (Exception ex)
         {
@@ -107,7 +141,7 @@ internal static class Program
                 {
                     await using var failConnection = new NpgsqlConnection(options.ConnectionString);
                     await failConnection.OpenAsync();
-                    await CompleteScanRunAsync(failConnection, scanRunId.Value, status: "failed", error: ex.Message);
+                    await CompleteScanRunAsync(failConnection, scanRunId.Value, status: "failed", error: ex.Message, metrics: null);
                 }
                 catch
                 {
@@ -145,13 +179,23 @@ internal static class Program
         return Convert.ToInt64(result);
     }
 
-    private static async Task CompleteScanRunAsync(NpgsqlConnection connection, long scanRunId, string status, string? error)
+    private static async Task CompleteScanRunAsync(
+        NpgsqlConnection connection,
+        long scanRunId,
+        string status,
+        string? error,
+        ScanMetrics? metrics)
     {
         const string sql = """
                            UPDATE scan_runs
                            SET status = @status,
                                finished_at_utc = @finished_at_utc,
-                               error = @error
+                               error = @error,
+                               projects_count = @projects_count,
+                               files_count = @files_count,
+                               symbols_count = @symbols_count,
+                               relations_count = @relations_count,
+                               duration_ms = @duration_ms
                            WHERE id = @id;
                            """;
 
@@ -159,6 +203,11 @@ internal static class Program
         command.Parameters.AddWithValue("status", status);
         command.Parameters.AddWithValue("finished_at_utc", DateTimeOffset.UtcNow);
         command.Parameters.AddWithValue("error", (object?)error ?? DBNull.Value);
+        command.Parameters.AddWithValue("projects_count", metrics?.ProjectsCount is null ? DBNull.Value : metrics.Value.ProjectsCount);
+        command.Parameters.AddWithValue("files_count", metrics?.FilesCount is null ? DBNull.Value : metrics.Value.FilesCount);
+        command.Parameters.AddWithValue("symbols_count", metrics?.SymbolsCount is null ? DBNull.Value : metrics.Value.SymbolsCount);
+        command.Parameters.AddWithValue("relations_count", metrics?.RelationsCount is null ? DBNull.Value : metrics.Value.RelationsCount);
+        command.Parameters.AddWithValue("duration_ms", metrics?.DurationMs is null ? DBNull.Value : metrics.Value.DurationMs);
         command.Parameters.AddWithValue("id", scanRunId);
         await command.ExecuteNonQueryAsync();
     }
@@ -190,9 +239,13 @@ internal static class Program
 
         var extractedSymbols = new List<ExtractedSymbol>();
         var extractedRelations = new List<ExtractedRelation>();
+        var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var projectsCount = 0;
 
         foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
         {
+            projectsCount++;
+
             foreach (var document in project.Documents)
             {
                 if (!document.SupportsSyntaxTree)
@@ -213,6 +266,10 @@ internal static class Program
                 }
 
                 var filePath = document.FilePath;
+                if (!string.IsNullOrWhiteSpace(filePath))
+                {
+                    files.Add(filePath);
+                }
 
                 foreach (var node in syntaxRoot.DescendantNodes())
                 {
@@ -265,7 +322,85 @@ internal static class Program
             .DistinctBy(r => (r.FromSymbolKey, r.RelationType, r.ToSymbolKey))
             .ToList();
 
-        return new ExtractionResult(distinctSymbols, distinctRelations);
+        return new ExtractionResult(distinctSymbols, distinctRelations, projectsCount, files.Count);
+    }
+
+    private static async Task<ReportResult> ExecuteReportAsync(ReportOptions options)
+    {
+        var pingResult = await CheckDatabaseConnectionAsync(options.ConnectionString);
+        if (!pingResult.Success)
+        {
+            return ReportResult.Fail($"PostgreSQL health-check failed: {pingResult.Error}", isDatabaseError: true);
+        }
+
+        var schemaResult = await EnsureSchemaAsync(options.ConnectionString);
+        if (!schemaResult.Success)
+        {
+            return ReportResult.Fail($"Schema initialization failed: {schemaResult.Error}", isDatabaseError: true);
+        }
+
+        const string sql = """
+                           SELECT
+                               id,
+                               commit_sha,
+                               started_at_utc,
+                               finished_at_utc,
+                               projects_count,
+                               files_count,
+                               symbols_count,
+                               relations_count,
+                               duration_ms
+                           FROM latest_successful_scan_runs
+                           WHERE repo_path = @repo_path;
+                           """;
+
+        try
+        {
+            await using var connection = new NpgsqlConnection(options.ConnectionString);
+            await connection.OpenAsync();
+
+            await using var command = new NpgsqlCommand(sql, connection);
+            command.Parameters.AddWithValue("repo_path", options.RepoPath);
+
+            await using var reader = await command.ExecuteReaderAsync();
+            if (!await reader.ReadAsync())
+            {
+                return ReportResult.Fail($"No successful scan snapshot found for repo: {options.RepoPath}", isDatabaseError: false);
+            }
+
+            var report = new ScanReport(
+                ScanRunId: reader.GetInt64(0),
+                CommitSha: reader.GetString(1),
+                StartedAtUtc: reader.GetFieldValue<DateTimeOffset>(2),
+                FinishedAtUtc: reader.IsDBNull(3) ? null : reader.GetFieldValue<DateTimeOffset>(3),
+                ProjectsCount: reader.IsDBNull(4) ? 0 : reader.GetInt32(4),
+                FilesCount: reader.IsDBNull(5) ? 0 : reader.GetInt32(5),
+                SymbolsCount: reader.IsDBNull(6) ? 0 : reader.GetInt32(6),
+                RelationsCount: reader.IsDBNull(7) ? 0 : reader.GetInt32(7),
+                DurationMs: reader.IsDBNull(8) ? 0 : reader.GetInt64(8));
+
+            PrintReport(options.RepoPath, report);
+            return ReportResult.Ok();
+        }
+        catch (Exception ex)
+        {
+            return ReportResult.Fail(ex.Message, isDatabaseError: true);
+        }
+    }
+
+    private static void PrintReport(string repoPath, ScanReport report)
+    {
+        Console.WriteLine("[info] Scan report (latest successful snapshot)");
+        Console.WriteLine($"[info] Repo: {repoPath}");
+        Console.WriteLine($"[info] RunId: {report.ScanRunId}");
+        Console.WriteLine($"[info] Commit: {report.CommitSha}");
+        Console.WriteLine($"[info] StartedAtUtc: {report.StartedAtUtc:O}");
+        Console.WriteLine($"[info] FinishedAtUtc: {report.FinishedAtUtc:O}");
+        Console.WriteLine($"[info] Projects: {report.ProjectsCount}");
+        Console.WriteLine($"[info] Files: {report.FilesCount}");
+        Console.WriteLine($"[info] Symbols: {report.SymbolsCount}");
+        Console.WriteLine($"[info] Relations: {report.RelationsCount}");
+        Console.WriteLine($"[info] DurationMs: {report.DurationMs}");
     }
 
     private static async Task InsertSymbolsAsync(NpgsqlConnection connection, long scanRunId, IReadOnlyCollection<ExtractedSymbol> symbols)
@@ -320,8 +455,19 @@ internal static class Program
                                      status TEXT NOT NULL,
                                      started_at_utc TIMESTAMPTZ NOT NULL,
                                      finished_at_utc TIMESTAMPTZ NULL,
+                                      projects_count INTEGER NULL,
+                                      files_count INTEGER NULL,
+                                      symbols_count INTEGER NULL,
+                                      relations_count INTEGER NULL,
+                                      duration_ms BIGINT NULL,
                                      error TEXT NULL
                                  );
+
+                                  ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS projects_count INTEGER NULL;
+                                  ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS files_count INTEGER NULL;
+                                  ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS symbols_count INTEGER NULL;
+                                  ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS relations_count INTEGER NULL;
+                                  ALTER TABLE scan_runs ADD COLUMN IF NOT EXISTS duration_ms BIGINT NULL;
 
                                  CREATE INDEX IF NOT EXISTS ix_scan_runs_repo_path_started_at
                                      ON scan_runs (repo_path, started_at_utc DESC);
@@ -337,6 +483,11 @@ internal static class Program
                                      status,
                                      started_at_utc,
                                      finished_at_utc,
+                                     projects_count,
+                                     files_count,
+                                     symbols_count,
+                                     relations_count,
+                                     duration_ms,
                                      error
                                  FROM scan_runs
                                  WHERE status = 'succeeded'
@@ -471,6 +622,33 @@ internal static class Program
         return true;
     }
 
+    private static bool TryParseReportArguments(string[] args, out ReportOptions options, out string error)
+    {
+        options = default;
+        error = string.Empty;
+
+        if (!string.Equals(args[0], ReportCommand, StringComparison.OrdinalIgnoreCase))
+        {
+            error = $"Unsupported command '{args[0]}' for report parser.";
+            return false;
+        }
+
+        var parsed = ParseNamedArguments(args.Skip(1).ToArray());
+
+        if (!TryGetRequiredArgument(parsed, RepoArg, out var repoPath, out error))
+        {
+            return false;
+        }
+
+        if (!TryGetConnectionString(parsed, out var connectionString, out error))
+        {
+            return false;
+        }
+
+        options = new ReportOptions(repoPath, connectionString);
+        return true;
+    }
+
     private static bool TryGetConnectionString(
         IReadOnlyDictionary<string, string> parsed,
         out string connectionString,
@@ -549,11 +727,15 @@ internal static class Program
         Console.WriteLine("Usage:");
         Console.WriteLine(
             "  Mcp.Scanner scan --solution <path.sln> --repo <repo-path> --commit <sha> [--connection <connection-string>]");
+        Console.WriteLine(
+            "  Mcp.Scanner report --repo <repo-path> [--connection <connection-string>]");
         Console.WriteLine();
         Console.WriteLine($"Or set environment variable: {EnvironmentConnection}");
     }
 
     private readonly record struct ScanOptions(string SolutionPath, string RepoPath, string CommitSha, string ConnectionString);
+
+    private readonly record struct ReportOptions(string RepoPath, string ConnectionString);
 
     private readonly record struct DatabasePingResult(bool Success, string? Error)
     {
@@ -566,19 +748,57 @@ internal static class Program
         long ScanRunId,
         int SymbolsCount,
         int RelationsCount,
+        int ProjectsCount,
+        int FilesCount,
+        long DurationMs,
         long? LatestSuccessfulScanRunId,
         string? Error)
     {
-        public static SymbolScanResult Ok(long scanRunId, int symbolsCount, int relationsCount, long? latestSuccessfulScanRunId)
-            => new(true, scanRunId, symbolsCount, relationsCount, latestSuccessfulScanRunId, null);
+        public static SymbolScanResult Ok(long scanRunId, ScanMetrics metrics, long? latestSuccessfulScanRunId)
+            => new(
+                true,
+                scanRunId,
+                metrics.SymbolsCount,
+                metrics.RelationsCount,
+                metrics.ProjectsCount,
+                metrics.FilesCount,
+                metrics.DurationMs,
+                latestSuccessfulScanRunId,
+                null);
 
         public static SymbolScanResult Fail(string error)
-            => new(false, 0, 0, 0, null, error);
+            => new(false, 0, 0, 0, 0, 0, 0, null, error);
     }
 
     private readonly record struct ExtractionResult(
         IReadOnlyCollection<ExtractedSymbol> Symbols,
-        IReadOnlyCollection<ExtractedRelation> Relations);
+        IReadOnlyCollection<ExtractedRelation> Relations,
+        int ProjectsCount,
+        int FilesCount);
+
+    private readonly record struct ScanMetrics(
+        int ProjectsCount,
+        int FilesCount,
+        int SymbolsCount,
+        int RelationsCount,
+        long DurationMs);
+
+    private readonly record struct ScanReport(
+        long ScanRunId,
+        string CommitSha,
+        DateTimeOffset StartedAtUtc,
+        DateTimeOffset? FinishedAtUtc,
+        int ProjectsCount,
+        int FilesCount,
+        int SymbolsCount,
+        int RelationsCount,
+        long DurationMs);
+
+    private readonly record struct ReportResult(bool Success, bool IsDatabaseError, string? Error)
+    {
+        public static ReportResult Ok() => new(true, false, null);
+        public static ReportResult Fail(string error, bool isDatabaseError) => new(false, isDatabaseError, error);
+    }
 
     private sealed record ExtractedSymbol(
         string SymbolKey,
