@@ -1,0 +1,6 @@
+@MemoryMcpServer_HostAddress = http://localhost:5288
+
+GET {{MemoryMcpServer_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
