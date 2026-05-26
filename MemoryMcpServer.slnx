@@ -1,3 +1,1 @@
-<Solution>
-  <Project Path="Mcp.Scanner/Mcp.Scanner.csproj" />
-</Solution>
+<Solution>`n  <Project Path="Mcp.Scanner/Mcp.Scanner.csproj" />`n  <Project Path="MemoryMcpServer/MemoryMcpServer.csproj" />`n</Solution>

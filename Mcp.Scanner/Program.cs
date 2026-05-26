@@ -18,6 +18,7 @@ internal static class Program
 
     private const string ScanCommand = "scan";
     private const string ReportCommand = "report";
+    private const string ValidateCommand = "validate";
     private const string SolutionArg = "--solution";
     private const string RepoArg = "--repo";
     private const string CommitArg = "--commit";
@@ -62,6 +63,26 @@ internal static class Program
                 }
 
                 Console.WriteLine("[info] Stage 6 report completed successfully.");
+                return SuccessExitCode;
+            }
+
+            if (string.Equals(command, ValidateCommand, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!TryParseReportArguments(args, out var validateOptions, out var validateValidationError))
+                {
+                    Console.Error.WriteLine($"[error] {validateValidationError}");
+                    PrintUsage();
+                    return InvalidArgumentsExitCode;
+                }
+
+                var validateResult = await ExecuteReportAsync(validateOptions, shutdownCts.Token);
+                if (!validateResult.Success)
+                {
+                    Console.Error.WriteLine($"[error] Stage 6 validate failed: {validateResult.Error}");
+                    return validateResult.IsDatabaseError ? DatabaseErrorExitCode : InvalidArgumentsExitCode;
+                }
+
+                Console.WriteLine("[info] Stage 6 validate completed successfully.");
                 return SuccessExitCode;
             }
 
@@ -134,7 +155,7 @@ internal static class Program
             scanRunId = await CreateScanRunAsync(connection, options, cancellationToken);
             var currentScanRunId = scanRunId.Value;
 
-            var extraction = await ExtractFactsAsync(options.SolutionPath, cancellationToken);
+            var extraction = await ExtractFactsAsync(options.SolutionPath, options.RepoPath, cancellationToken);
 
             var symbols = extraction.Symbols;
             var relations = extraction.Relations;
@@ -257,17 +278,17 @@ internal static class Program
         return Convert.ToInt64(result);
     }
 
-    private static async Task<ExtractionResult> ExtractFactsAsync(string solutionPath, CancellationToken cancellationToken)
+    private static async Task<ExtractionResult> ExtractFactsAsync(string solutionPath, string repoPath, CancellationToken cancellationToken)
     {
         using var workspace = MSBuildWorkspace.Create();
-        var solution = await workspace.OpenSolutionAsync(solutionPath, cancellationToken: cancellationToken);
+        var projects = await LoadProjectsForScanAsync(workspace, solutionPath, repoPath, cancellationToken);
 
         var extractedSymbols = new List<ExtractedSymbol>();
         var extractedRelations = new List<ExtractedRelation>();
         var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var projectsCount = 0;
 
-        foreach (var project in solution.Projects.Where(p => p.Language == LanguageNames.CSharp))
+        foreach (var project in projects)
         {
             cancellationToken.ThrowIfCancellationRequested();
             projectsCount++;
@@ -350,6 +371,43 @@ internal static class Program
             .ToList();
 
         return new ExtractionResult(distinctSymbols, distinctRelations, projectsCount, files.Count);
+    }
+
+    private static async Task<IReadOnlyCollection<Project>> LoadProjectsForScanAsync(
+        MSBuildWorkspace workspace,
+        string solutionPath,
+        string repoPath,
+        CancellationToken cancellationToken)
+    {
+        var extension = Path.GetExtension(solutionPath);
+
+        if (string.Equals(extension, ".sln", StringComparison.OrdinalIgnoreCase))
+        {
+            var solution = await workspace.OpenSolutionAsync(solutionPath, cancellationToken: cancellationToken);
+            return solution.Projects.Where(p => p.Language == LanguageNames.CSharp).ToArray();
+        }
+
+        if (string.Equals(extension, ".slnx", StringComparison.OrdinalIgnoreCase))
+        {
+            var projectFiles = Directory
+                .EnumerateFiles(repoPath, "*.csproj", SearchOption.AllDirectories)
+                .ToArray();
+
+            var projects = new List<Project>(projectFiles.Length);
+            foreach (var projectFile in projectFiles)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var project = await workspace.OpenProjectAsync(projectFile, cancellationToken: cancellationToken);
+                if (string.Equals(project.Language, LanguageNames.CSharp, StringComparison.Ordinal))
+                {
+                    projects.Add(project);
+                }
+            }
+
+            return projects;
+        }
+
+        throw new InvalidOperationException($"Unsupported solution format '{extension}'. Use .sln or .slnx.");
     }
 
     private static async Task<ReportResult> ExecuteReportAsync(ReportOptions options, CancellationToken cancellationToken)
@@ -676,6 +734,14 @@ internal static class Program
             return false;
         }
 
+        var extension = Path.GetExtension(solutionPath);
+        if (!string.Equals(extension, ".sln", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(extension, ".slnx", StringComparison.OrdinalIgnoreCase))
+        {
+            error = $"Unsupported solution format '{extension}'. Use .sln or .slnx.";
+            return false;
+        }
+
         if (!Directory.Exists(repoPath))
         {
             error = $"Repository directory was not found: {repoPath}";
@@ -691,9 +757,10 @@ internal static class Program
         options = default;
         error = string.Empty;
 
-        if (!string.Equals(args[0], ReportCommand, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(args[0], ReportCommand, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(args[0], ValidateCommand, StringComparison.OrdinalIgnoreCase))
         {
-            error = $"Unsupported command '{args[0]}' for report parser.";
+            error = $"Unsupported command '{args[0]}' for report/validate parser.";
             return false;
         }
 
@@ -793,6 +860,8 @@ internal static class Program
             "  Mcp.Scanner scan --solution <path.sln> --repo <repo-path> --commit <sha> [--connection <connection-string>]");
         Console.WriteLine(
             "  Mcp.Scanner report --repo <repo-path> [--connection <connection-string>]");
+        Console.WriteLine(
+            "  Mcp.Scanner validate --repo <repo-path> [--connection <connection-string>]");
         Console.WriteLine();
         Console.WriteLine($"Or set environment variable: {EnvironmentConnection}");
     }
