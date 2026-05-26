@@ -56,12 +56,13 @@ internal static class Program
             var scanResult = await ExecuteSymbolScanAsync(scanOptions);
             if (!scanResult.Success)
             {
-                Console.Error.WriteLine($"[error] Stage 4 scan failed: {scanResult.Error}");
+                Console.Error.WriteLine($"[error] Stage 5 scan failed: {scanResult.Error}");
                 return UnexpectedErrorExitCode;
             }
 
-            Console.WriteLine($"[info] Stage 4 scan: OK (runId={scanResult.ScanRunId}, symbols={scanResult.SymbolsCount}, relations={scanResult.RelationsCount})");
-            Console.WriteLine("[info] Stage 4 completed successfully.");
+            Console.WriteLine($"[info] Stage 5 scan: OK (runId={scanResult.ScanRunId}, symbols={scanResult.SymbolsCount}, relations={scanResult.RelationsCount})");
+            Console.WriteLine($"[info] Latest successful snapshot for repo: {scanResult.LatestSuccessfulScanRunId}");
+            Console.WriteLine("[info] Stage 5 completed successfully.");
             return SuccessExitCode;
         }
         catch (Exception ex)
@@ -73,6 +74,8 @@ internal static class Program
 
     private static async Task<SymbolScanResult> ExecuteSymbolScanAsync(ScanOptions options)
     {
+        long? scanRunId = null;
+
         try
         {
             EnsureMsBuildRegistered();
@@ -80,21 +83,38 @@ internal static class Program
             await using var connection = new NpgsqlConnection(options.ConnectionString);
             await connection.OpenAsync();
 
-            var scanRunId = await CreateScanRunAsync(connection, options);
+            scanRunId = await CreateScanRunAsync(connection, options);
+            var currentScanRunId = scanRunId.Value;
 
             var extraction = await ExtractFactsAsync(options.SolutionPath);
 
             var symbols = extraction.Symbols;
             var relations = extraction.Relations;
 
-            await InsertSymbolsAsync(connection, scanRunId, symbols);
-            await InsertRelationsAsync(connection, scanRunId, relations);
+            await InsertSymbolsAsync(connection, currentScanRunId, symbols);
+            await InsertRelationsAsync(connection, currentScanRunId, relations);
 
-            await CompleteScanRunAsync(connection, scanRunId, status: "succeeded", error: null);
-            return SymbolScanResult.Ok(scanRunId, symbols.Count, relations.Count);
+            await CompleteScanRunAsync(connection, currentScanRunId, status: "succeeded", error: null);
+
+            var latestSuccessfulRunId = await GetLatestSuccessfulScanRunIdAsync(connection, options.RepoPath);
+            return SymbolScanResult.Ok(currentScanRunId, symbols.Count, relations.Count, latestSuccessfulRunId);
         }
         catch (Exception ex)
         {
+            if (scanRunId.HasValue)
+            {
+                try
+                {
+                    await using var failConnection = new NpgsqlConnection(options.ConnectionString);
+                    await failConnection.OpenAsync();
+                    await CompleteScanRunAsync(failConnection, scanRunId.Value, status: "failed", error: ex.Message);
+                }
+                catch
+                {
+                    // ignore secondary failure, первичная ошибка уже будет возвращена
+                }
+            }
+
             return SymbolScanResult.Fail(ex.Message);
         }
     }
@@ -141,6 +161,26 @@ internal static class Program
         command.Parameters.AddWithValue("error", (object?)error ?? DBNull.Value);
         command.Parameters.AddWithValue("id", scanRunId);
         await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<long?> GetLatestSuccessfulScanRunIdAsync(NpgsqlConnection connection, string repoPath)
+    {
+        const string sql = """
+                           SELECT id
+                           FROM latest_successful_scan_runs
+                           WHERE repo_path = @repo_path;
+                           """;
+
+        await using var command = new NpgsqlCommand(sql, connection);
+        command.Parameters.AddWithValue("repo_path", repoPath);
+
+        var result = await command.ExecuteScalarAsync();
+        if (result is null or DBNull)
+        {
+            return null;
+        }
+
+        return Convert.ToInt64(result);
     }
 
     private static async Task<ExtractionResult> ExtractFactsAsync(string solutionPath)
@@ -285,6 +325,22 @@ internal static class Program
 
                                  CREATE INDEX IF NOT EXISTS ix_scan_runs_repo_path_started_at
                                      ON scan_runs (repo_path, started_at_utc DESC);
+
+                                 CREATE INDEX IF NOT EXISTS ix_scan_runs_repo_status_started_at
+                                     ON scan_runs (repo_path, status, started_at_utc DESC);
+
+                                 CREATE OR REPLACE VIEW latest_successful_scan_runs AS
+                                 SELECT DISTINCT ON (repo_path)
+                                     id,
+                                     repo_path,
+                                     commit_sha,
+                                     status,
+                                     started_at_utc,
+                                     finished_at_utc,
+                                     error
+                                 FROM scan_runs
+                                 WHERE status = 'succeeded'
+                                 ORDER BY repo_path, started_at_utc DESC;
 
                                  CREATE TABLE IF NOT EXISTS symbols
                                  (
@@ -505,13 +561,19 @@ internal static class Program
         public static DatabasePingResult Fail(string error) => new(false, error);
     }
 
-    private readonly record struct SymbolScanResult(bool Success, long ScanRunId, int SymbolsCount, int RelationsCount, string? Error)
+    private readonly record struct SymbolScanResult(
+        bool Success,
+        long ScanRunId,
+        int SymbolsCount,
+        int RelationsCount,
+        long? LatestSuccessfulScanRunId,
+        string? Error)
     {
-        public static SymbolScanResult Ok(long scanRunId, int symbolsCount, int relationsCount)
-            => new(true, scanRunId, symbolsCount, relationsCount, null);
+        public static SymbolScanResult Ok(long scanRunId, int symbolsCount, int relationsCount, long? latestSuccessfulScanRunId)
+            => new(true, scanRunId, symbolsCount, relationsCount, latestSuccessfulScanRunId, null);
 
         public static SymbolScanResult Fail(string error)
-            => new(false, 0, 0, 0, error);
+            => new(false, 0, 0, 0, null, error);
     }
 
     private readonly record struct ExtractionResult(
