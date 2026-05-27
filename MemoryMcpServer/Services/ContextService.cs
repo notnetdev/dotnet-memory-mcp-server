@@ -51,8 +51,8 @@ public sealed class ContextService : IContextService
         await connection.OpenAsync(cancellationToken);
 
         var relatedSymbols = await ExpandRelatedSymbolsAsync(connection, retrieval.ScanRunId.Value, retrieval.PrimaryTargets, cancellationToken);
-        var proposedEdits = BuildProposedEdits(retrieval.TaskIntent, retrieval.PrimaryTargets);
-        var verification = BuildVerification(retrieval.PrimaryTargets);
+        var proposedEdits = BuildProposedEdits(retrieval.TaskIntent, retrieval.PrimaryTargets, relatedSymbols);
+        var verification = BuildVerification(retrieval.PrimaryTargets, relatedSymbols);
         var inclusionReasons = BuildInclusionReasons(
             retrieval.PrimaryTargets,
             relatedSymbols,
@@ -105,30 +105,41 @@ public sealed class ContextService : IContextService
         while (await reader.ReadAsync(cancellationToken))
         {
             var toSymbol = reader.GetString(1);
+            var relationType = reader.GetString(2);
             var kind = reader.IsDBNull(3) ? "external" : reader.GetString(3);
             var filePath = reader.IsDBNull(4) ? null : reader.GetString(4);
-            list.Add(new RelatedSymbol(toSymbol, kind, filePath));
+            list.Add(new RelatedSymbol(toSymbol, kind, filePath, relationType));
         }
 
         return list
-            .DistinctBy(x => x.SymbolKey)
-            .OrderBy(x => x.SymbolKey, StringComparer.Ordinal)
+            .DistinctBy(x => (x.SymbolKey, x.RelationType))
+            .OrderBy(x => x.RelationType, StringComparer.Ordinal)
+            .ThenBy(x => x.SymbolKey, StringComparer.Ordinal)
             .Take(20)
             .ToArray();
     }
 
-    private static IReadOnlyList<ProposedEdit> BuildProposedEdits(IReadOnlyList<string> intent, IReadOnlyList<ContextTarget> primaryTargets)
+    private static IReadOnlyList<ProposedEdit> BuildProposedEdits(
+        IReadOnlyList<string> intent,
+        IReadOnlyList<ContextTarget> primaryTargets,
+        IReadOnlyList<RelatedSymbol> relatedSymbols)
     {
+        var relatedBySymbol = relatedSymbols
+            .GroupBy(x => x.SymbolKey, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.Select(x => x.RelationType).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray(), StringComparer.Ordinal);
+
         return primaryTargets
             .Take(5)
             .Select(t => new ProposedEdit(
                 What: $"{string.Join('+', intent)} {t.Kind}",
                 Where: t.FilePath ?? t.SymbolKey,
-                Why: "Matched by task/scope/filesHint and ranked by deterministic rules."))
+                Why: relatedBySymbol.TryGetValue(t.SymbolKey, out var relationTypes) && relationTypes.Length > 0
+                    ? $"Matched by task/scope/filesHint and connected via {string.Join(',', relationTypes)}."
+                    : "Matched by task/scope/filesHint and ranked by deterministic rules."))
             .ToArray();
     }
 
-    private static IReadOnlyList<string> BuildVerification(IReadOnlyList<ContextTarget> primaryTargets)
+    private static IReadOnlyList<string> BuildVerification(IReadOnlyList<ContextTarget> primaryTargets, IReadOnlyList<RelatedSymbol> relatedSymbols)
     {
         var verification = new List<string>
         {
@@ -139,6 +150,16 @@ public sealed class ContextService : IContextService
         if (primaryTargets.Any(t => string.Equals(t.Kind, "method", StringComparison.OrdinalIgnoreCase)))
         {
             verification.Add("verify callers of changed methods");
+        }
+
+        if (relatedSymbols.Any(x => string.Equals(x.RelationType, "implements", StringComparison.OrdinalIgnoreCase)))
+        {
+            verification.Add("verify interface-to-implementation behavior");
+        }
+
+        if (relatedSymbols.Any(x => string.Equals(x.RelationType, "declared_in_file", StringComparison.OrdinalIgnoreCase)))
+        {
+            verification.Add("verify changed files compile with related declarations");
         }
 
         return verification
@@ -170,7 +191,13 @@ public sealed class ContextService : IContextService
 
         foreach (var related in relatedSymbols)
         {
-            reasons.Add(new InclusionReason(related.SymbolKey, "expanded_by_graph_1_hop"));
+            var reason = string.Equals(related.RelationType, "implements", StringComparison.OrdinalIgnoreCase)
+                ? "expanded_by_implements"
+                : string.Equals(related.RelationType, "declared_in_file", StringComparison.OrdinalIgnoreCase)
+                    ? "expanded_by_declared_in_file"
+                    : "expanded_by_graph_1_hop";
+
+            reasons.Add(new InclusionReason(related.SymbolKey, reason));
         }
 
         if (!string.IsNullOrWhiteSpace(scope))

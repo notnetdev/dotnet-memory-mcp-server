@@ -13,7 +13,7 @@ public sealed record GetContextResponse(
 
 public sealed record ContextTarget(string SymbolKey, string? FilePath, string Kind, double Score);
 
-public sealed record RelatedSymbol(string SymbolKey, string Kind, string? FilePath);
+public sealed record RelatedSymbol(string SymbolKey, string Kind, string? FilePath, string RelationType);
 
 public sealed record ProposedEdit(string What, string Where, string Why);
 

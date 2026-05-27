@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "MemoryMcpServer": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:61033;http://localhost:61034"
+    }
+  }
+}
