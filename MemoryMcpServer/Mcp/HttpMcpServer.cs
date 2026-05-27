@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using MemoryMcpServer.Contracts;
@@ -6,158 +5,22 @@ using MemoryMcpServer.Services;
 
 namespace MemoryMcpServer.Mcp;
 
-public sealed class StdioMcpServer
+public static class HttpMcpServer
 {
+    private const string ToolName = "memory_get_context";
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
-    private readonly IContextService _contextService;
-    private readonly ILogger<StdioMcpServer> _logger;
-
-    public StdioMcpServer(IContextService contextService, ILogger<StdioMcpServer> logger)
+    public static async Task<JsonObject?> ProcessAsync(
+        JsonObject request,
+        IContextService contextService,
+        ILogger logger,
+        string traceId,
+        CancellationToken cancellationToken)
     {
-        _contextService = contextService;
-        _logger = logger;
-    }
-
-    public async Task RunAsync(CancellationToken cancellationToken)
-    {
-        _logger.LogInformation("Starting MCP stdio server...");
-
-        using var input = Console.OpenStandardInput();
-        using var output = Console.OpenStandardOutput();
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            var message = await ReadMessageAsync(input, cancellationToken);
-            if (message is null)
-            {
-                break;
-            }
-
-            var response = await ProcessMessageAsync(message, cancellationToken);
-            if (response is not null)
-            {
-                await WriteMessageAsync(output, response, cancellationToken);
-            }
-        }
-    }
-
-    private async Task<string?> ReadMessageAsync(Stream input, CancellationToken cancellationToken)
-    {
-        var headerText = await ReadHeadersAsync(input, cancellationToken);
-        if (headerText is null)
-        {
-            return null;
-        }
-
-        var contentLength = ParseContentLength(headerText);
-        if (contentLength <= 0)
-        {
-            return null;
-        }
-
-        var payload = new byte[contentLength];
-        var read = 0;
-        while (read < contentLength)
-        {
-            var chunk = await input.ReadAsync(payload.AsMemory(read, contentLength - read), cancellationToken);
-            if (chunk <= 0)
-            {
-                return null;
-            }
-
-            read += chunk;
-        }
-
-        return Encoding.UTF8.GetString(payload);
-    }
-
-    private static async Task<string?> ReadHeadersAsync(Stream input, CancellationToken cancellationToken)
-    {
-        var buffer = new List<byte>(256);
-        var state = 0;
-
-        while (true)
-        {
-            var one = new byte[1];
-            var read = await input.ReadAsync(one.AsMemory(0, 1), cancellationToken);
-            if (read == 0)
-            {
-                return buffer.Count == 0 ? null : Encoding.ASCII.GetString(buffer.ToArray());
-            }
-
-            var b = one[0];
-            buffer.Add(b);
-
-            state = state switch
-            {
-                0 when b == (byte)'\r' => 1,
-                1 when b == (byte)'\n' => 2,
-                2 when b == (byte)'\r' => 3,
-                3 when b == (byte)'\n' => 4,
-                _ => 0
-            };
-
-            if (state == 4)
-            {
-                break;
-            }
-        }
-
-        return Encoding.ASCII.GetString(buffer.ToArray());
-    }
-
-    private static int ParseContentLength(string headers)
-    {
-        var lines = headers.Split(["\r\n"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        foreach (var line in lines)
-        {
-            if (!line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            var value = line["Content-Length:".Length..].Trim();
-            if (int.TryParse(value, out var length))
-            {
-                return length;
-            }
-        }
-
-        return -1;
-    }
-
-    private static async Task WriteMessageAsync(Stream output, JsonObject payload, CancellationToken cancellationToken)
-    {
-        var json = payload.ToJsonString(JsonOptions);
-        var body = Encoding.UTF8.GetBytes(json);
-        var header = Encoding.ASCII.GetBytes($"Content-Length: {body.Length}\r\n\r\n");
-
-        await output.WriteAsync(header, cancellationToken);
-        await output.WriteAsync(body, cancellationToken);
-        await output.FlushAsync(cancellationToken);
-    }
-
-    private async Task<JsonObject?> ProcessMessageAsync(string message, CancellationToken cancellationToken)
-    {
-        JsonObject? request;
-        try
-        {
-            request = JsonNode.Parse(message)?.AsObject();
-        }
-        catch (JsonException)
-        {
-            return BuildErrorResponse(null, -32700, "Parse error");
-        }
-
-        if (request is null)
-        {
-            return BuildErrorResponse(null, -32600, "Invalid Request");
-        }
-
         var id = request["id"]?.DeepClone();
         var method = request["method"]?.GetValue<string>();
 
@@ -175,7 +38,7 @@ public sealed class StdioMcpServer
         {
             "initialize" => BuildResultResponse(id, BuildInitializeResult()),
             "tools/list" => BuildResultResponse(id, BuildToolsListResult()),
-            "tools/call" => await HandleToolsCallAsync(id, request["params"]?.AsObject(), cancellationToken),
+            "tools/call" => await HandleToolsCallAsync(id, request["params"]?.AsObject(), contextService, logger, traceId, cancellationToken),
             "ping" => BuildResultResponse(id, new JsonObject()),
             _ => BuildErrorResponse(id, -32601, $"Method not found: {method}")
         };
@@ -209,7 +72,7 @@ public sealed class StdioMcpServer
             {
                 new JsonObject
                 {
-                    ["name"] = "memory.get_context",
+                    ["name"] = ToolName,
                     ["description"] = "Returns deterministic context pack from local scanner snapshot data.",
                     ["inputSchema"] = new JsonObject
                     {
@@ -248,7 +111,13 @@ public sealed class StdioMcpServer
         };
     }
 
-    private async Task<JsonObject> HandleToolsCallAsync(JsonNode? id, JsonObject? @params, CancellationToken cancellationToken)
+    private static async Task<JsonObject> HandleToolsCallAsync(
+        JsonNode? id,
+        JsonObject? @params,
+        IContextService contextService,
+        ILogger logger,
+        string traceId,
+        CancellationToken cancellationToken)
     {
         if (@params is null)
         {
@@ -256,7 +125,10 @@ public sealed class StdioMcpServer
         }
 
         var name = @params["name"]?.GetValue<string>();
-        if (!string.Equals(name, "memory.get_context", StringComparison.Ordinal))
+        var isSupportedName = string.Equals(name, ToolName, StringComparison.Ordinal)
+                              || string.Equals(name, "memory.get_context", StringComparison.Ordinal);
+
+        if (!isSupportedName)
         {
             return BuildErrorResponse(id, -32602, $"Unknown tool: {name}");
         }
@@ -274,8 +146,7 @@ public sealed class StdioMcpServer
 
         try
         {
-            var traceId = Guid.NewGuid().ToString("N");
-            var result = await _contextService.GetContextAsync(
+            var result = await contextService.GetContextAsync(
                 new GetContextRequest(task, scope, constraints, filesHint),
                 traceId,
                 cancellationToken);
@@ -297,7 +168,7 @@ public sealed class StdioMcpServer
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "MCP tools/call failed for memory.get_context");
+            logger.LogError(ex, "MCP tools/call failed for memory.get_context");
             return BuildResultResponse(id, new JsonObject
             {
                 ["isError"] = true,

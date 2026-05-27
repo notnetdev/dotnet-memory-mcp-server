@@ -1,3 +1,4 @@
+using System.Text.Json.Nodes;
 using MemoryMcpServer.Contracts;
 using MemoryMcpServer.Mcp;
 using MemoryMcpServer.Options;
@@ -11,22 +12,25 @@ builder.Services.Configure<RetrievalOptions>(builder.Configuration.GetSection("R
 builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<RetrievalOptions>>().Value);
 builder.Services.AddScoped<IContextRetrievalService, ContextRetrievalService>();
 builder.Services.AddScoped<IContextService, ContextService>();
-builder.Services.AddScoped<StdioMcpServer>();
 
 var app = builder.Build();
-
-if (args.Any(a => string.Equals(a, "--stdio", StringComparison.OrdinalIgnoreCase)))
-{
-    await using var scope = app.Services.CreateAsyncScope();
-    var mcpServer = scope.ServiceProvider.GetRequiredService<StdioMcpServer>();
-    await mcpServer.RunAsync(app.Lifetime.ApplicationStopping);
-    return;
-}
 
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
 }
+
+app.MapPost("/mcp", async (HttpContext httpContext, JsonObject request, IContextService contextService, ILoggerFactory loggerFactory, CancellationToken cancellationToken) =>
+{
+    var logger = loggerFactory.CreateLogger("HttpMcpServer");
+    var response = await HttpMcpServer.ProcessAsync(request, contextService, logger, httpContext.TraceIdentifier, cancellationToken);
+    if (response is null)
+    {
+        return Results.NoContent();
+    }
+
+    return Results.Json(response);
+});
 
 app.MapPost("/memory/get-context", async (HttpContext httpContext, GetContextRequest request, IContextService contextService, CancellationToken cancellationToken) =>
 {
