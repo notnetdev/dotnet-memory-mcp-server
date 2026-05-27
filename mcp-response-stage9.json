@@ -1,0 +1,195 @@
+﻿{
+    "jsonrpc":  "2.0",
+    "id":  "real-task-stage9-show",
+    "result":  {
+                   "isError":  false,
+                   "structuredContent":  {
+                                             "task":  "??? 9: ??? v1 - ???????????? ???? ? draft",
+                                             "scope":  "API",
+                                             "constraintsApplied":  [
+                                                                        "**/Tests/**",
+                                                                        "**/WebRoutes*"
+                                                                    ],
+                                             "freshness":  {
+                                                               "commit":  "e324eb5a122d00cc19eefcb6fd9198165e232185",
+                                                               "indexedAtUtc":  "2026-05-27T10:00:23.418992+00:00"
+                                                           },
+                                             "primaryTargets":  {
+                                                                    "count":  10,
+                                                                    "items":  [
+                                                                                  {
+                                                                                      "path":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs",
+                                                                                      "symbols":  [
+                                                                                                      "GeoDraftsSettings"
+                                                                                                  ],
+                                                                                      "lineHints":  [
+
+                                                                                                    ],
+                                                                                      "why":  "ranked:matched_by_symbol_name"
+                                                                                  },
+                                                                                  {
+                                                                                      "path":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/UseCases/CreateGeoDraft/CreateGeoDraftCommandHandler.cs",
+                                                                                      "symbols":  [
+                                                                                                      "CreateGeoDraftCommandHandler",
+                                                                                                      "CancellationToken)"
+                                                                                                  ],
+                                                                                      "lineHints":  [
+
+                                                                                                    ],
+                                                                                      "why":  "ranked:matched_by_symbol_name"
+                                                                                  },
+                                                                                  {
+                                                                                      "path":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/UseCases/ListMyGeoDrafts/ListMyGeoDraftsQueryHandler.cs",
+                                                                                      "symbols":  [
+                                                                                                      "ListMyGeoDraftsQueryHandler",
+                                                                                                      "CancellationToken)"
+                                                                                                  ],
+                                                                                      "lineHints":  [
+
+                                                                                                    ],
+                                                                                      "why":  "ranked:matched_by_symbol_name"
+                                                                                  },
+                                                                                  {
+                                                                                      "path":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/IceComplexes/UseCases/AttachPhotoToDraft/AttachPhotoToIceComplexDraftCommandHandler.cs",
+                                                                                      "symbols":  [
+                                                                                                      "AttachPhotoToIceComplexDraftCommandHandler",
+                                                                                                      "CancellationToken)"
+                                                                                                  ],
+                                                                                      "lineHints":  [
+
+                                                                                                    ],
+                                                                                      "why":  "ranked:matched_by_symbol_name"
+                                                                                  },
+                                                                                  {
+                                                                                      "path":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/IceComplexes/UseCases/CreateDraft/CreateIceComplexDraftCommandHandler.cs",
+                                                                                      "symbols":  [
+                                                                                                      "CreateIceComplexDraftCommandHandler",
+                                                                                                      "CancellationToken)"
+                                                                                                  ],
+                                                                                      "lineHints":  [
+
+                                                                                                    ],
+                                                                                      "why":  "ranked:matched_by_symbol_name"
+                                                                                  },
+                                                                                  {
+                                                                                      "path":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/IceComplexes/UseCases/DeleteDraft/DeleteIceComplexDraftCommandHandler.cs",
+                                                                                      "symbols":  [
+                                                                                                      "DeleteIceComplexDraftCommandHandler"
+                                                                                                  ],
+                                                                                      "lineHints":  [
+
+                                                                                                    ],
+                                                                                      "why":  "ranked:matched_by_symbol_name"
+                                                                                  }
+                                                                              ]
+                                                                },
+                                             "relatedSymbols":  {
+                                                                    "count":  11,
+                                                                    "items":  [
+                                                                                  {
+                                                                                      "symbol":  "cs",
+                                                                                      "declaredIn":  null,
+                                                                                      "usedFrom":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs"
+                                                                                  },
+                                                                                  {
+                                                                                      "symbol":  "cs",
+                                                                                      "declaredIn":  null,
+                                                                                      "usedFrom":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs"
+                                                                                  },
+                                                                                  {
+                                                                                      "symbol":  "cs",
+                                                                                      "declaredIn":  null,
+                                                                                      "usedFrom":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs"
+                                                                                  },
+                                                                                  {
+                                                                                      "symbol":  "cs",
+                                                                                      "declaredIn":  null,
+                                                                                      "usedFrom":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs"
+                                                                                  },
+                                                                                  {
+                                                                                      "symbol":  "cs",
+                                                                                      "declaredIn":  null,
+                                                                                      "usedFrom":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs"
+                                                                                  },
+                                                                                  {
+                                                                                      "symbol":  "cs",
+                                                                                      "declaredIn":  null,
+                                                                                      "usedFrom":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs"
+                                                                                  },
+                                                                                  {
+                                                                                      "symbol":  "Guid\u003e",
+                                                                                      "declaredIn":  null,
+                                                                                      "usedFrom":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs"
+                                                                                  },
+                                                                                  {
+                                                                                      "symbol":  "N\u003e",
+                                                                                      "declaredIn":  null,
+                                                                                      "usedFrom":  "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs"
+                                                                                  }
+                                                                              ]
+                                                                },
+                                             "retrievalConstraintsApplied":  [
+                                                                                 "?? ??????? ????????? ??????? API",
+                                                                                 "??? ????????? ?",
+                                                                                 "scope:API"
+                                                                             ],
+                                             "topology":  {
+                                                              "focus":  [
+                                                                            "GeoDraftsSettings",
+                                                                            "CreateGeoDraftCommandHandler",
+                                                                            "CancellationToken)",
+                                                                            "ListMyGeoDraftsQueryHandler"
+                                                                        ],
+                                                              "flow":  [
+                                                                           "CreateGeoDraftCommandHandler"
+                                                                       ],
+                                                              "uiBoundary":  [
+
+                                                                             ],
+                                                              "entrypoints":  [
+
+                                                                              ],
+                                                              "executionPath":  [
+
+                                                                                ],
+                                                              "implementedBy":  [
+                                                                                    "Guid\u003e",
+                                                                                    "N\u003e",
+                                                                                    "MyGeoDraftListItem\u003e\u003e"
+                                                                                ],
+                                                              "declaredIn":  [
+
+                                                                             ],
+                                                              "exclude":  [
+                                                                              "**/Tests/**",
+                                                                              "**/WebRoutes*"
+                                                                          ],
+                                                              "highConfidenceBoundary":  [
+                                                                                             "command-handler-flow"
+                                                                                         ]
+                                                          },
+                                             "actionableShortlistTop10":  [
+                                                                              "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/GeoDraftsSettings.cs",
+                                                                              "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/UseCases/CreateGeoDraft/CreateGeoDraftCommandHandler.cs",
+                                                                              "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/Drafts/UseCases/ListMyGeoDrafts/ListMyGeoDraftsQueryHandler.cs",
+                                                                              "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/IceComplexes/UseCases/AttachPhotoToDraft/AttachPhotoToIceComplexDraftCommandHandler.cs",
+                                                                              "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/IceComplexes/UseCases/CreateDraft/CreateIceComplexDraftCommandHandler.cs",
+                                                                              "Hockey.V4.Mcp.Tests.2/Hockey.Application/GeoObjects/IceComplexes/UseCases/DeleteDraft/DeleteIceComplexDraftCommandHandler.cs"
+                                                                          ],
+                                             "mcpTop3":  [
+                                                             "GeoDraftsSettings",
+                                                             "CreateGeoDraftCommandHandler",
+                                                             "CancellationToken)"
+                                                         ],
+                                             "trace":  {
+                                                           "traceId":  "0HNLS2TAJ2NQ2:00000005"
+                                                       }
+                                         },
+                   "content":  [
+                                   {
+                                       "type":  "text",
+                                       "text":  "{\"primaryTargetsCount\":10,\"relatedSymbolsCount\":11,\"commit\":\"e324eb5a122d00cc19eefcb6fd9198165e232185\",\"topologyPresent\":true,\"mcpTop3\":[\"GeoDraftsSettings\",\"CreateGeoDraftCommandHandler\",\"CancellationToken)\"]}"
+                                   }
+                               ]
+               }
+}
