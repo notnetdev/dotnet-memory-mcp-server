@@ -391,20 +391,25 @@ internal static class Program
         {
             var projectFiles = Directory
                 .EnumerateFiles(repoPath, "*.csproj", SearchOption.AllDirectories)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
 
-            var projects = new List<Project>(projectFiles.Length);
             foreach (var projectFile in projectFiles)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var project = await workspace.OpenProjectAsync(projectFile, cancellationToken: cancellationToken);
-                if (string.Equals(project.Language, LanguageNames.CSharp, StringComparison.Ordinal))
+
+                if (workspace.CurrentSolution.Projects.Any(p =>
+                        string.Equals(p.FilePath, projectFile, StringComparison.OrdinalIgnoreCase)))
                 {
-                    projects.Add(project);
+                    continue;
                 }
+
+                var project = await workspace.OpenProjectAsync(projectFile, cancellationToken: cancellationToken);
             }
 
-            return projects;
+            return workspace.CurrentSolution.Projects
+                .Where(p => p.Language == LanguageNames.CSharp)
+                .ToArray();
         }
 
         throw new InvalidOperationException($"Unsupported solution format '{extension}'. Use .sln or .slnx.");

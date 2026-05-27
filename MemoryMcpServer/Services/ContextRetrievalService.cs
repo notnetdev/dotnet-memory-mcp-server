@@ -1,34 +1,17 @@
 using MemoryMcpServer.Contracts;
+using MemoryMcpServer.Options;
 using Npgsql;
 
 namespace MemoryMcpServer.Services;
 
 public sealed class ContextRetrievalService : IContextRetrievalService
 {
-    private static readonly IReadOnlyDictionary<string, string[]> RuEnHintMap =
-        new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["контекст"] = ["context"],
-            ["контекстн"] = ["context"],
-            ["сервис"] = ["service"],
-            ["сервисн"] = ["service"],
-            ["интерфейс"] = ["interface"],
-            ["интерфейсн"] = ["interface"],
-            ["реализация"] = ["implementation"],
-            ["реализ"] = ["implementation"],
-            ["сканер"] = ["scanner"],
-            ["метод"] = ["method"],
-            ["класс"] = ["class"],
-            ["проект"] = ["project"],
-            ["файл"] = ["file"],
-            ["проверка"] = ["verify", "validation"],
-            ["тест"] = ["test"]
-        };
-
     private readonly string _connectionString;
+    private readonly RetrievalOptions _options;
 
-    public ContextRetrievalService(IConfiguration configuration)
+    public ContextRetrievalService(IConfiguration configuration, RetrievalOptions options)
     {
+        _options = options ?? new RetrievalOptions();
         _connectionString = configuration["MCP_SCANNER_CONNECTION"]
             ?? Environment.GetEnvironmentVariable("MCP_SCANNER_CONNECTION")
             ?? throw new InvalidOperationException("MCP_SCANNER_CONNECTION is required.");
@@ -52,7 +35,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
             .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        var parsed = ParseTask(task);
+        var parsed = ParseTask(task, _options.Language);
 
         await using var connection = new NpgsqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -77,19 +60,20 @@ public sealed class ContextRetrievalService : IContextRetrievalService
             scope,
             filesHint,
             constraints,
+            _options,
             cancellationToken);
 
         var primaryTargets = candidates
             .OrderByDescending(c => c.Score)
             .ThenBy(c => c.SymbolKey, StringComparer.Ordinal)
-            .Take(10)
+            .Take(_options.Limits.MaxPrimaryTargets)
             .Select(c => new ContextTarget(c.SymbolKey, c.FilePath, c.Kind, c.Score))
             .ToArray();
 
         var primaryTargetReasons = candidates
             .OrderByDescending(c => c.Score)
             .ThenBy(c => c.SymbolKey, StringComparer.Ordinal)
-            .Take(10)
+            .Take(_options.Limits.MaxPrimaryTargets)
             .ToDictionary(c => c.SymbolKey, c => c.Reason, StringComparer.Ordinal);
 
         return new RetrievalResult(
@@ -102,7 +86,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
             ConstraintsApplied: BuildConstraintsApplied(constraints, scope, filesHint));
     }
 
-    private static ParsedTask ParseTask(string task)
+    private static ParsedTask ParseTask(string task, LanguageOptions languageOptions)
     {
         var normalizedTask = NormalizeText(task);
         var actions = new List<string>();
@@ -125,7 +109,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        var expandedHints = ExpandHints(normalizedTokens);
+        var expandedHints = ExpandHints(normalizedTokens, languageOptions);
 
         var targetHints = expandedHints
             .Where(t => !actions.Contains(t, StringComparer.OrdinalIgnoreCase))
@@ -180,6 +164,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
         string scope,
         IReadOnlyList<string> filesHint,
         IReadOnlyList<string> constraints,
+        RetrievalOptions options,
         CancellationToken cancellationToken)
     {
         const string sql = """
@@ -215,7 +200,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
             var hasFileHint = !string.IsNullOrWhiteSpace(filePath) && filesHint.Any(h => filePath.Contains(h, StringComparison.OrdinalIgnoreCase));
             if (hasFileHint)
             {
-                score += 100.0; // жесткий приоритет filesHint
+                score += options.Scoring.FileHintBoost;
                 reason = "matched_by_file_hint";
             }
 
@@ -230,7 +215,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
 
             if (matchedHints.Length > 0)
             {
-                score += 10.0;
+                score += options.Scoring.TargetHintBoost;
                 if (!hasFileHint)
                 {
                     reason = matchedHints.Any(IsRuSourceHint)
@@ -243,10 +228,21 @@ public sealed class ContextRetrievalService : IContextRetrievalService
                 (scopeTokens.Any(t => symbolKey.Contains(t, StringComparison.OrdinalIgnoreCase)) ||
                  (!string.IsNullOrWhiteSpace(filePath) && scopeTokens.Any(t => filePath.Contains(t, StringComparison.OrdinalIgnoreCase)))))
             {
-                score += 3.0;
+                score += options.Scoring.ScopeBoost;
             }
 
-            if (score <= 0)
+            if (options.Filters.RequireScopeMatchWhenProvided && scopeTokens.Length > 0)
+            {
+                var scopeMatched = scopeTokens.Any(t => symbolKey.Contains(t, StringComparison.OrdinalIgnoreCase))
+                                   || (!string.IsNullOrWhiteSpace(filePath) && scopeTokens.Any(t => filePath.Contains(t, StringComparison.OrdinalIgnoreCase)));
+
+                if (!scopeMatched && !hasFileHint)
+                {
+                    continue;
+                }
+            }
+
+            if (score < options.Scoring.MinScoreToInclude)
             {
                 continue;
             }
@@ -276,7 +272,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
             .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-    private static string[] ExpandHints(IReadOnlyList<string> normalizedTokens)
+    private static string[] ExpandHints(IReadOnlyList<string> normalizedTokens, LanguageOptions languageOptions)
     {
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -284,7 +280,12 @@ public sealed class ContextRetrievalService : IContextRetrievalService
         {
             result.Add(token);
 
-            if (RuEnHintMap.TryGetValue(token, out var mapped))
+            if (!languageOptions.RuSynonymsEnabled)
+            {
+                continue;
+            }
+
+            if (languageOptions.RuEnHintMap.TryGetValue(token, out var mapped))
             {
                 foreach (var mappedToken in mapped)
                 {
@@ -292,7 +293,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
                 }
             }
 
-            foreach (var pair in RuEnHintMap)
+            foreach (var pair in languageOptions.RuEnHintMap)
             {
                 if (token.StartsWith(pair.Key, StringComparison.OrdinalIgnoreCase) ||
                     pair.Key.StartsWith(token, StringComparison.OrdinalIgnoreCase))

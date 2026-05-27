@@ -1,9 +1,13 @@
 using MemoryMcpServer.Contracts;
+using MemoryMcpServer.Options;
 using MemoryMcpServer.Services;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddOpenApi();
+builder.Services.Configure<RetrievalOptions>(builder.Configuration.GetSection("Retrieval"));
+builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<RetrievalOptions>>().Value);
 builder.Services.AddScoped<IContextRetrievalService, ContextRetrievalService>();
 builder.Services.AddScoped<IContextService, ContextService>();
 

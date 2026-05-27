@@ -1,4 +1,5 @@
 using MemoryMcpServer.Contracts;
+using MemoryMcpServer.Options;
 using Npgsql;
 
 namespace MemoryMcpServer.Services;
@@ -8,11 +9,13 @@ public sealed class ContextService : IContextService
     private readonly IContextRetrievalService _retrievalService;
     private readonly string _connectionString;
     private readonly ILogger<ContextService> _logger;
+    private readonly RetrievalOptions _options;
 
-    public ContextService(IContextRetrievalService retrievalService, IConfiguration configuration, ILogger<ContextService> logger)
+    public ContextService(IContextRetrievalService retrievalService, IConfiguration configuration, ILogger<ContextService> logger, RetrievalOptions options)
     {
         _retrievalService = retrievalService;
         _logger = logger;
+        _options = options ?? new RetrievalOptions();
         _connectionString = configuration["MCP_SCANNER_CONNECTION"]
             ?? Environment.GetEnvironmentVariable("MCP_SCANNER_CONNECTION")
             ?? throw new InvalidOperationException("MCP_SCANNER_CONNECTION is required.");
@@ -58,8 +61,8 @@ public sealed class ContextService : IContextService
         await using var connection = new NpgsqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
 
-        var relatedSymbols = await ExpandRelatedSymbolsAsync(connection, retrieval.ScanRunId.Value, retrieval.PrimaryTargets, cancellationToken);
-        var proposedEdits = BuildProposedEdits(retrieval.TaskIntent, retrieval.PrimaryTargets, relatedSymbols);
+        var relatedSymbols = await ExpandRelatedSymbolsAsync(connection, retrieval.ScanRunId.Value, retrieval.PrimaryTargets, _options, cancellationToken);
+        var proposedEdits = BuildProposedEdits(retrieval.TaskIntent, retrieval.PrimaryTargets, relatedSymbols, _options);
         var verification = BuildVerification(retrieval.PrimaryTargets, relatedSymbols);
         var inclusionReasons = BuildInclusionReasons(
             retrieval.PrimaryTargets,
@@ -70,7 +73,7 @@ public sealed class ContextService : IContextService
             retrieval.TargetHints,
             retrieval.PrimaryTargetReasons);
 
-        var confidence = CalculateConfidence(retrieval.PrimaryTargets, filesHint, constraints);
+        var confidence = CalculateConfidence(retrieval.PrimaryTargets, filesHint, constraints, _options.Confidence);
 
         _logger.LogInformation(
             "memory.get_context trace={TraceId} runId={RunId} commit={Commit} indexedAt={IndexedAtUtc:o} primaryTargets={PrimaryTargetsCount} relatedSymbols={RelatedSymbolsCount} confidence={Confidence}; reasons={Reasons}",
@@ -99,6 +102,7 @@ public sealed class ContextService : IContextService
         NpgsqlConnection connection,
         long runId,
         IReadOnlyList<ContextTarget> primaryTargets,
+        RetrievalOptions options,
         CancellationToken cancellationToken)
     {
         if (primaryTargets.Count == 0)
@@ -135,21 +139,22 @@ public sealed class ContextService : IContextService
             .DistinctBy(x => (x.SymbolKey, x.RelationType))
             .OrderBy(x => x.RelationType, StringComparer.Ordinal)
             .ThenBy(x => x.SymbolKey, StringComparer.Ordinal)
-            .Take(20)
+            .Take(options.Limits.MaxRelatedSymbols)
             .ToArray();
     }
 
     private static IReadOnlyList<ProposedEdit> BuildProposedEdits(
         IReadOnlyList<string> intent,
         IReadOnlyList<ContextTarget> primaryTargets,
-        IReadOnlyList<RelatedSymbol> relatedSymbols)
+        IReadOnlyList<RelatedSymbol> relatedSymbols,
+        RetrievalOptions options)
     {
         var relatedBySymbol = relatedSymbols
             .GroupBy(x => x.SymbolKey, StringComparer.Ordinal)
             .ToDictionary(g => g.Key, g => g.Select(x => x.RelationType).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray(), StringComparer.Ordinal);
 
         return primaryTargets
-            .Take(5)
+            .Take(options.Limits.MaxProposedEdits)
             .Select(t => new ProposedEdit(
                 What: $"{string.Join('+', intent)} {t.Kind}",
                 Where: t.FilePath ?? t.SymbolKey,
@@ -267,23 +272,24 @@ public sealed class ContextService : IContextService
     private static double CalculateConfidence(
         IReadOnlyList<ContextTarget> primaryTargets,
         IReadOnlyList<string> filesHint,
-        IReadOnlyList<string> constraints)
+        IReadOnlyList<string> constraints,
+        ConfidenceOptions options)
     {
         if (primaryTargets.Count == 0)
         {
-            return 0.1;
+            return options.EmptyScore;
         }
 
-        var baseScore = 0.4;
-        var targetsBoost = Math.Min(0.3, primaryTargets.Count * 0.03);
-        var fileHintBoost = filesHint.Count > 0 ? 0.2 : 0;
-        var constraintsPenalty = constraints.Count > 0 ? 0.05 : 0;
+        var baseScore = options.BaseScore;
+        var targetsBoost = Math.Min(options.MaxTargetsBoost, primaryTargets.Count * options.TargetBoostPerItem);
+        var fileHintBoost = filesHint.Count > 0 ? options.FileHintBoost : 0;
+        var constraintsPenalty = constraints.Count > 0 ? options.ConstraintsPenalty : 0;
 
         var score = baseScore + targetsBoost + fileHintBoost - constraintsPenalty;
-        return Math.Round(Math.Clamp(score, 0.0, 0.99), 2);
+        return Math.Round(Math.Clamp(score, 0.0, options.MaxScore), 2);
     }
 
-    private static GetContextResponse BuildEmptyResponse(IReadOnlyList<string> intent, IReadOnlyList<string> constraintsApplied)
+    private GetContextResponse BuildEmptyResponse(IReadOnlyList<string> intent, IReadOnlyList<string> constraintsApplied)
     {
         return new GetContextResponse(
             TaskIntent: intent,
@@ -293,7 +299,7 @@ public sealed class ContextService : IContextService
             ProposedEdits: Array.Empty<ProposedEdit>(),
             Verification: ["dotnet build"],
             Freshness: new Freshness("unknown", DateTimeOffset.UtcNow),
-            Confidence: 0.1,
+            Confidence: _options.Confidence.EmptyScore,
             InclusionReasons: [new InclusionReason("request", "no_snapshot_found")]);
     }
 }
