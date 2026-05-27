@@ -24,6 +24,41 @@ dotnet run --project .\MemoryMcpServer\MemoryMcpServer.csproj
 
 - `POST /memory/get-context`
 
+## Запуск как MCP server (stdio)
+
+Для подключения из MCP-клиента (в т.ч. Agent mode в IDE) можно запускать сервер в stdio-режиме:
+
+```powershell
+$env:MCP_SCANNER_CONNECTION="Host=localhost;Port=5432;Database=Sky;Username=postgres;"
+dotnet run --project .\MemoryMcpServer\MemoryMcpServer.csproj -- --stdio
+```
+
+Поддерживаемый tool:
+
+- `memory.get_context`
+
+Пример MCP-конфига клиента (схема может отличаться в зависимости от клиента):
+
+```json
+{
+  "mcpServers": {
+	"memory": {
+	  "command": "dotnet",
+	  "args": [
+		"run",
+		"--project",
+		"C:/Users/Sergey/source/repos/MemoryMcpServer/MemoryMcpServer/MemoryMcpServer.csproj",
+		"--",
+		"--stdio"
+	  ],
+	  "env": {
+		"MCP_SCANNER_CONNECTION": "Host=localhost;Port=5432;Database=Sky;Username=postgres;"
+	  }
+	}
+  }
+}
+```
+
 ## Пример запроса
 
 ```json
