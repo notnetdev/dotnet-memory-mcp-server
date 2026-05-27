@@ -14,9 +14,12 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
-app.MapPost("/memory/get-context", async (GetContextRequest request, IContextService contextService, CancellationToken cancellationToken) =>
+app.MapPost("/memory/get-context", async (HttpContext httpContext, GetContextRequest request, IContextService contextService, CancellationToken cancellationToken) =>
 {
-    var response = await contextService.GetContextAsync(request, cancellationToken);
+    var traceId = httpContext.TraceIdentifier;
+    var response = await contextService.GetContextAsync(request, traceId, cancellationToken);
+
+    httpContext.Response.Headers.Append("x-trace-id", traceId);
     return Results.Ok(response);
 });
 

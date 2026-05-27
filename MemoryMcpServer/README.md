@@ -59,3 +59,20 @@ Invoke-RestMethod -Method Post -Uri "http://localhost:5000/memory/get-context" -
 - `freshness`
 - `confidence`
 - `inclusion_reasons`
+
+## Русскоязычные задачи (MVP)
+
+- Retrieval поддерживает русские формулировки задач: базовые intent-маркеры + нормализация токенов.
+- Для повышения точности применяются RU->EN синонимы (например: `интерфейс -> interface`, `сервис -> service`).
+- Если известны конкретные файлы/классы, рекомендуется явно передавать их в `filesHint`.
+
+Пример запроса на русском:
+
+```json
+{
+  "task": "исправить контекст для интерфейса и его реализации в сервисе",
+  "scope": "Mcp.Scanner",
+  "constraints": ["do-not-touch:bin,obj"],
+  "filesHint": ["ContextService.cs"]
+}
+```

@@ -5,6 +5,26 @@ namespace MemoryMcpServer.Services;
 
 public sealed class ContextRetrievalService : IContextRetrievalService
 {
+    private static readonly IReadOnlyDictionary<string, string[]> RuEnHintMap =
+        new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["контекст"] = ["context"],
+            ["контекстн"] = ["context"],
+            ["сервис"] = ["service"],
+            ["сервисн"] = ["service"],
+            ["интерфейс"] = ["interface"],
+            ["интерфейсн"] = ["interface"],
+            ["реализация"] = ["implementation"],
+            ["реализ"] = ["implementation"],
+            ["сканер"] = ["scanner"],
+            ["метод"] = ["method"],
+            ["класс"] = ["class"],
+            ["проект"] = ["project"],
+            ["файл"] = ["file"],
+            ["проверка"] = ["verify", "validation"],
+            ["тест"] = ["test"]
+        };
+
     private readonly string _connectionString;
 
     public ContextRetrievalService(IConfiguration configuration)
@@ -46,6 +66,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
                 TaskIntent: parsed.Actions,
                 TargetHints: parsed.TargetHints,
                 PrimaryTargets: Array.Empty<ContextTarget>(),
+                PrimaryTargetReasons: new Dictionary<string, string>(StringComparer.Ordinal),
                 ConstraintsApplied: BuildConstraintsApplied(constraints, scope, filesHint));
         }
 
@@ -65,32 +86,48 @@ public sealed class ContextRetrievalService : IContextRetrievalService
             .Select(c => new ContextTarget(c.SymbolKey, c.FilePath, c.Kind, c.Score))
             .ToArray();
 
+        var primaryTargetReasons = candidates
+            .OrderByDescending(c => c.Score)
+            .ThenBy(c => c.SymbolKey, StringComparer.Ordinal)
+            .Take(10)
+            .ToDictionary(c => c.SymbolKey, c => c.Reason, StringComparer.Ordinal);
+
         return new RetrievalResult(
             ScanRunId: snapshot.Value.RunId,
             Freshness: new Freshness(snapshot.Value.CommitSha, snapshot.Value.IndexedAtUtc),
             TaskIntent: parsed.Actions,
             TargetHints: parsed.TargetHints,
             PrimaryTargets: primaryTargets,
+            PrimaryTargetReasons: primaryTargetReasons,
             ConstraintsApplied: BuildConstraintsApplied(constraints, scope, filesHint));
     }
 
     private static ParsedTask ParseTask(string task)
     {
+        var normalizedTask = NormalizeText(task);
         var actions = new List<string>();
 
-        if (ContainsAny(task, "add", "new", "добав")) actions.Add("add");
-        if (ContainsAny(task, "change", "update", "измени", "обнов")) actions.Add("change");
-        if (ContainsAny(task, "fix", "bug", "ошиб", "исправ")) actions.Add("fix");
-        if (ContainsAny(task, "remove", "delete", "удал")) actions.Add("remove");
-        if (ContainsAny(task, "refactor", "рефактор")) actions.Add("refactor");
-        if (ContainsAny(task, "test", "тест")) actions.Add("test");
+        if (ContainsAny(normalizedTask, "add", "new", "добав")) actions.Add("add");
+        if (ContainsAny(normalizedTask, "change", "update", "измени", "обнов")) actions.Add("change");
+        if (ContainsAny(normalizedTask, "fix", "bug", "ошиб", "исправ", "почин")) actions.Add("fix");
+        if (ContainsAny(normalizedTask, "remove", "delete", "удал")) actions.Add("remove");
+        if (ContainsAny(normalizedTask, "refactor", "рефактор")) actions.Add("refactor");
+        if (ContainsAny(normalizedTask, "test", "тест")) actions.Add("test");
 
         if (actions.Count == 0)
         {
             actions.Add("change");
         }
 
-        var targetHints = Tokenize(task)
+        var normalizedTokens = Tokenize(normalizedTask)
+            .Select(NormalizeToken)
+            .Where(t => t.Length >= 2)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var expandedHints = ExpandHints(normalizedTokens);
+
+        var targetHints = expandedHints
             .Where(t => !actions.Contains(t, StringComparer.OrdinalIgnoreCase))
             .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -173,16 +210,33 @@ public sealed class ContextRetrievalService : IContextRetrievalService
             }
 
             var score = 0.0;
+            var reason = "matched_by_scope";
 
             var hasFileHint = !string.IsNullOrWhiteSpace(filePath) && filesHint.Any(h => filePath.Contains(h, StringComparison.OrdinalIgnoreCase));
             if (hasFileHint)
             {
                 score += 100.0; // жесткий приоритет filesHint
+                reason = "matched_by_file_hint";
             }
 
-            if (targetHints.Any(h => symbolKey.Contains(h, StringComparison.OrdinalIgnoreCase) || name.Contains(h, StringComparison.OrdinalIgnoreCase)))
+            var matchedHints = targetHints
+                .Where(h =>
+                {
+                    var matchToken = NormalizeHintForMatch(h);
+                    return symbolKey.Contains(matchToken, StringComparison.OrdinalIgnoreCase)
+                           || name.Contains(matchToken, StringComparison.OrdinalIgnoreCase);
+                })
+                .ToArray();
+
+            if (matchedHints.Length > 0)
             {
                 score += 10.0;
+                if (!hasFileHint)
+                {
+                    reason = matchedHints.Any(IsRuSourceHint)
+                        ? "matched_by_ru_synonym"
+                        : "matched_by_symbol_name";
+                }
             }
 
             if (scopeTokens.Length > 0 &&
@@ -197,7 +251,7 @@ public sealed class ContextRetrievalService : IContextRetrievalService
                 continue;
             }
 
-            result.Add(new Candidate(symbolKey, kind, filePath, score));
+            result.Add(new Candidate(symbolKey, kind, filePath, score, reason));
         }
 
         return result;
@@ -221,6 +275,54 @@ public sealed class ContextRetrievalService : IContextRetrievalService
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+
+    private static string[] ExpandHints(IReadOnlyList<string> normalizedTokens)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var token in normalizedTokens)
+        {
+            result.Add(token);
+
+            if (RuEnHintMap.TryGetValue(token, out var mapped))
+            {
+                foreach (var mappedToken in mapped)
+                {
+                    result.Add($"ru_synonym:{mappedToken}");
+                }
+            }
+
+            foreach (var pair in RuEnHintMap)
+            {
+                if (token.StartsWith(pair.Key, StringComparison.OrdinalIgnoreCase) ||
+                    pair.Key.StartsWith(token, StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var mappedToken in pair.Value)
+                    {
+                        result.Add($"ru_synonym:{mappedToken}");
+                    }
+                }
+            }
+        }
+
+        return result.ToArray();
+    }
+
+    private static bool IsRuSourceHint(string hint)
+        => hint.StartsWith("ru_synonym:", StringComparison.OrdinalIgnoreCase);
+
+    private static string NormalizeHintForMatch(string hint)
+        => hint.StartsWith("ru_synonym:", StringComparison.OrdinalIgnoreCase)
+            ? hint["ru_synonym:".Length..]
+            : hint;
+
+    private static string NormalizeToken(string token)
+    {
+        return token.Trim().ToLowerInvariant().Replace('ё', 'е');
+    }
+
+    private static string NormalizeText(string text)
+        => text.ToLowerInvariant().Replace('ё', 'е');
 
     private static string[] Tokenize(string value)
         => value.Split([' ', ',', '.', ';', ':', '/', '\\', '(', ')', '[', ']', '{', '}', '-', '_', '"', '\''], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -256,5 +358,5 @@ public sealed class ContextRetrievalService : IContextRetrievalService
 
     private readonly record struct SnapshotInfo(long RunId, string RepoPath, string CommitSha, DateTimeOffset IndexedAtUtc);
 
-    private readonly record struct Candidate(string SymbolKey, string Kind, string? FilePath, double Score);
+    private readonly record struct Candidate(string SymbolKey, string Kind, string? FilePath, double Score, string Reason);
 }

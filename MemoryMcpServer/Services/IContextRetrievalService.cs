@@ -19,4 +19,5 @@ public sealed record RetrievalResult(
     IReadOnlyList<string> TaskIntent,
     IReadOnlyList<string> TargetHints,
     IReadOnlyList<ContextTarget> PrimaryTargets,
+    IReadOnlyDictionary<string, string> PrimaryTargetReasons,
     IReadOnlyList<string> ConstraintsApplied);

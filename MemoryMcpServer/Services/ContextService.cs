@@ -7,16 +7,18 @@ public sealed class ContextService : IContextService
 {
     private readonly IContextRetrievalService _retrievalService;
     private readonly string _connectionString;
+    private readonly ILogger<ContextService> _logger;
 
-    public ContextService(IContextRetrievalService retrievalService, IConfiguration configuration)
+    public ContextService(IContextRetrievalService retrievalService, IConfiguration configuration, ILogger<ContextService> logger)
     {
         _retrievalService = retrievalService;
+        _logger = logger;
         _connectionString = configuration["MCP_SCANNER_CONNECTION"]
             ?? Environment.GetEnvironmentVariable("MCP_SCANNER_CONNECTION")
             ?? throw new InvalidOperationException("MCP_SCANNER_CONNECTION is required.");
     }
 
-    public async Task<GetContextResponse> GetContextAsync(GetContextRequest request, CancellationToken cancellationToken)
+    public async Task<GetContextResponse> GetContextAsync(GetContextRequest request, string traceId, CancellationToken cancellationToken)
     {
         var normalizedTask = (request.Task ?? string.Empty).Trim();
         var normalizedScope = (request.Scope ?? string.Empty).Trim();
@@ -44,6 +46,12 @@ public sealed class ContextService : IContextService
 
         if (retrieval.ScanRunId is null)
         {
+            _logger.LogInformation(
+                "memory.get_context trace={TraceId} no snapshot found; taskIntent={TaskIntent} constraints={Constraints}",
+                traceId,
+                string.Join(',', retrieval.TaskIntent),
+                string.Join(',', retrieval.ConstraintsApplied));
+
             return BuildEmptyResponse(retrieval.TaskIntent, retrieval.ConstraintsApplied);
         }
 
@@ -59,9 +67,21 @@ public sealed class ContextService : IContextService
             filesHint,
             constraints,
             normalizedScope,
-            retrieval.TargetHints);
+            retrieval.TargetHints,
+            retrieval.PrimaryTargetReasons);
 
         var confidence = CalculateConfidence(retrieval.PrimaryTargets, filesHint, constraints);
+
+        _logger.LogInformation(
+            "memory.get_context trace={TraceId} runId={RunId} commit={Commit} indexedAt={IndexedAtUtc:o} primaryTargets={PrimaryTargetsCount} relatedSymbols={RelatedSymbolsCount} confidence={Confidence}; reasons={Reasons}",
+            traceId,
+            retrieval.ScanRunId,
+            retrieval.Freshness.Commit,
+            retrieval.Freshness.IndexedAtUtc,
+            retrieval.PrimaryTargets.Count,
+            relatedSymbols.Count,
+            confidence,
+            string.Join(";", inclusionReasons.Select(r => $"{r.Artifact}:{r.Reason}")));
 
         return new GetContextResponse(
             TaskIntent: retrieval.TaskIntent,
@@ -174,17 +194,26 @@ public sealed class ContextService : IContextService
         IReadOnlyList<string> filesHint,
         IReadOnlyList<string> constraints,
         string scope,
-        IReadOnlyList<string> targetHints)
+        IReadOnlyList<string> targetHints,
+        IReadOnlyDictionary<string, string> retrievalReasonLookup)
     {
         var reasons = new List<InclusionReason>();
 
         foreach (var target in primaryTargets)
         {
-            var reason = filesHint.Any(f => (target.FilePath ?? string.Empty).Contains(f, StringComparison.OrdinalIgnoreCase))
-                ? "matched_by_file_hint"
-                : targetHints.Any(h => target.SymbolKey.Contains(h, StringComparison.OrdinalIgnoreCase))
-                    ? "matched_by_symbol_name"
-                    : "matched_by_scope";
+            var reason = retrievalReasonLookup.TryGetValue(target.SymbolKey, out var retrievalReason)
+                ? retrievalReason
+                : filesHint.Any(f => (target.FilePath ?? string.Empty).Contains(f, StringComparison.OrdinalIgnoreCase))
+                    ? "matched_by_file_hint"
+                    : targetHints.Any(h => target.SymbolKey.Contains(h, StringComparison.OrdinalIgnoreCase))
+                        ? "matched_by_symbol_name"
+                        : "matched_by_scope";
+
+            if (string.Equals(reason, "matched_by_scope", StringComparison.OrdinalIgnoreCase)
+                && HasRuSynonymHit(target.SymbolKey, targetHints))
+            {
+                reason = "matched_by_ru_synonym";
+            }
 
             reasons.Add(new InclusionReason(target.SymbolKey, reason));
         }
@@ -214,6 +243,25 @@ public sealed class ContextService : IContextService
             .OrderBy(r => r.Artifact, StringComparer.Ordinal)
             .ThenBy(r => r.Reason, StringComparer.Ordinal)
             .ToArray();
+    }
+
+    private static bool HasRuSynonymHit(string symbolKey, IReadOnlyList<string> targetHints)
+    {
+        foreach (var hint in targetHints)
+        {
+            if (!hint.StartsWith("ru_synonym:", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var token = hint["ru_synonym:".Length..];
+            if (token.Length > 0 && symbolKey.Contains(token, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static double CalculateConfidence(

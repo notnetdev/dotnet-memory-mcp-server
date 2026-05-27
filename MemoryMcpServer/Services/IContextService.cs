@@ -4,5 +4,5 @@ namespace MemoryMcpServer.Services;
 
 public interface IContextService
 {
-    Task<GetContextResponse> GetContextAsync(GetContextRequest request, CancellationToken cancellationToken);
+    Task<GetContextResponse> GetContextAsync(GetContextRequest request, string traceId, CancellationToken cancellationToken);
 }
